@@ -86,6 +86,16 @@ mistaken for "safe".
 - An **I need help** button emails everyone at once (and always shows the emergency number).
 - Every tap can be undone, and every change is in the *who did what* log.
 
+## Accessible by design
+
+- Nothing relies on colour or icons alone: every dose says *"Not taken yet"* or *"Confirmed taken by Asha"* in
+  words, and each assistant line starts with *Urgent*, *To do*, *Good to know* or *Good news*.
+- Icons inside custom HTML are hidden from screen readers, so they read the words, not "red circle".
+- Every chart has a *"Show these numbers as a table"* alternative.
+- The page tells the browser which language it's in, so Hindi is read aloud with a Hindi voice.
+- Keyboard focus is clearly outlined, buttons are large, and large text is one switch away.
+- The printable medicine list is a proper table with column headers, in large print.
+
 ## Try it in two minutes
 
 ```bash
@@ -131,9 +141,19 @@ More detail in [docs/SECURITY.md](docs/SECURITY.md) and [docs/PRIVACY.md](docs/P
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest                     # 177 tests, plus 7 that drive the app in real Streamlit
+pytest                     # 294 tests, plus 7 that drive the app in real Streamlit
+python -m mypy             # type check (settings in mypy.ini)
 python manage.py --help    # backups, health check, key rotation, admin tasks
 ```
+
+How the code is kept tidy:
+
+- Every function is type-annotated and documented, and mypy checks it in CI with strict settings.
+- Screens and rules are split into small, named functions (none longer than 60 lines), and shared record types
+  live in `typedefs.py`.
+- `tests/test_code_quality.py` fails if any of that slips: missing hints or docstrings, long functions, long lines,
+  or an error silently swallowed.
+- CI runs the tests on Python 3.11, 3.12 and 3.13 with a coverage report, plus mypy, bandit and pip-audit.
 
 | File | What it does |
 |---|---|
@@ -147,8 +167,11 @@ python manage.py --help    # backups, health check, key rotation, admin tasks
 | `db.py`, `crypto.py` | SQLite with migrations, and field encryption. |
 | `maintenance.py`, `manage.py`, `health.py` | Backups, retention, admin commands, health checks. |
 | `i18n.py` | English and Hindi text for the elder's screens. |
+| `typedefs.py` | Shared type names (`Actor`, `Row`, `Member`...) used in signatures. |
 
 Settings live in `.env` locally or Streamlit secrets in the cloud (`APP_ENV` = development, demo or production).
+On Streamlit Community Cloud the app runs in **demo** mode unless `APP_ENV` says otherwise, because every app
+there is public.
 [REMEDIATION.md](REMEDIATION.md) lists the security review this project went through and what changed for each point.
 
 

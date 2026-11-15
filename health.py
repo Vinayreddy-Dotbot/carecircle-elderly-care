@@ -1,15 +1,20 @@
 """Health checks. `python manage.py health` exits non-zero when something is wrong, so a host or cron job can alert.
 Streamlit's own /_stcore/health endpoint only says the web server is up; this checks the parts that matter."""
+from __future__ import annotations
+
 import time
+from typing import Any
 
 import config
 import db
 
 
-def check():
+def check() -> dict[str, Any]:
+    """Check configuration, database, encryption key, reminder engine and email. Returns status and checks."""
     checks = []
 
-    def add(name, status, detail):
+    def add(name: str, status: str, detail: str) -> None:
+        """Record one check: ok, warn or fail."""
         checks.append({"check": name, "status": status, "detail": detail})
 
     errors, warnings = config.validate()
@@ -43,19 +48,21 @@ def check():
             age = time.time() - hb["at"]
             add("reminders", "ok" if age <= limit else "fail", f"last pass {int(age)}s ago ({hb['detail']})")
 
-    dead = db.q1("SELECT COUNT(*) AS n FROM outbox WHERE status='dead' AND created_at>=datetime('now','-1 day')")["n"]
-    backlog = db.q1("SELECT COUNT(*) AS n FROM outbox WHERE status='pending' AND next_attempt_at<? "
-                    "AND created_at<datetime('now','-10 minutes')", (time.time(),))["n"]
+    dead = db.count("SELECT COUNT(*) AS n FROM outbox WHERE status='dead' AND created_at>=datetime('now','-1 day')")
+    backlog = db.count("SELECT COUNT(*) AS n FROM outbox WHERE status='pending' AND next_attempt_at<? "
+                       "AND created_at<datetime('now','-10 minutes')", (time.time(),))
     add("email", "warn" if dead or backlog else "ok", f"{dead} undeliverable in 24h, {backlog} waiting over 10 minutes")
     return _summary(checks)
 
 
-def _summary(checks):
-    status = "fail" if any(c["status"] == "fail" for c in checks) else "warn" if any(c["status"] == "warn" for c in checks) else "ok"
+def _summary(checks: list[dict[str, str]]) -> dict[str, Any]:
+    """Overall status: the worst of the individual checks."""
+    found = {c["status"] for c in checks}
+    status = "fail" if "fail" in found else "warn" if "warn" in found else "ok"
     return {"status": status, "checks": checks}
 
 
-def reminder_engine_status():
+def reminder_engine_status() -> tuple[bool, str]:
     """(ok, message) for the in-app banner."""
     if config.scheduler_mode() == "off":
         return False, "Reminders are switched off on this server (SCHEDULER_MODE=off)."

@@ -17,13 +17,13 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: pip install -r requirements.txt -r requirements-dev.txt
-      - name: Tests (unit, security, concurrency, end-to-end, UI flows)
-        run: pytest -q --ignore=tests/test_app_streamlit.py
+      - name: Tests (unit, security, accessibility, code quality, concurrency, end-to-end, UI flows)
+        run: pytest -q --ignore=tests/test_app_streamlit.py --cov=. --cov-report=term-missing:skip-covered
       - name: UI tests in real Streamlit (informational until confirmed green)
         continue-on-error: true
         run: pytest -q tests/test_app_streamlit.py
 
-  security:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +31,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
+      - name: Type check (mypy, settings in mypy.ini)
+        run: python -m mypy
       - name: Static security scan (bandit)
         # B608 (SQL text built with f-strings) is skipped on purpose: table and column names come from fixed
         # allow-lists in db.py and every value is a bound parameter. tests/test_authz.py checks the allow-lists.

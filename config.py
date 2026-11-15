@@ -5,10 +5,15 @@ Precedence for every key: process environment > .env file > Streamlit secrets (.
 APP_ENV decides how strict the app is:
   development (default)  local machine. Sample family allowed. The Settings tab may write SMTP/Gemini keys to .env.
   demo                   public demo with sample data only. Sample family allowed. Secrets are read-only.
+                         The default on Streamlit Community Cloud, where every app is public.
   production             real people. Demo features off, secrets read-only, startup refuses unsafe configuration.
 An unrecognised APP_ENV value is treated as production (fail closed).
 """
+from __future__ import annotations
+
+import contextlib
 import os
+from typing import Any
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -20,13 +25,14 @@ UI_MANAGED = ["SMTP_USER", "SMTP_PASS", "GEMINI_API_KEY"]
 
 SECRETS_PATH = os.path.join(BASE_DIR, ".streamlit", "secrets.toml")
 _loaded = False
-_from_env_file = set()
-_secrets_cache = {"stamp": None, "values": {}}
+_from_env_file: set[str] = set()
+_secrets_cache: dict[str, Any] = {"stamp": None, "values": {}}
 use_secrets_files = True  # tests switch this off so a developer's real secrets are never read
 
 
-def _parse(path):
-    out = {}
+def _parse(path: str) -> dict[str, str]:
+    """Read KEY=value lines from a .env file (missing file: empty)."""
+    out: dict[str, str] = {}
     if not os.path.exists(path):
         return out
     with open(path, encoding="utf-8") as fh:
@@ -40,7 +46,8 @@ def _parse(path):
     return out
 
 
-def _load():
+def _load() -> None:
+    """Load .env into the process environment once, without overriding real environment variables."""
     global _loaded
     if _loaded:
         return
@@ -51,18 +58,15 @@ def _load():
             _from_env_file.add(k)
 
 
-def _load_toml(path):
-    try:
-        import tomllib  # Python 3.11+
+def _load_toml(path: str) -> dict[str, Any]:
+    """Parse a TOML file with tomllib, toml, or a minimal flat parser as a last resort."""
+    with contextlib.suppress(ImportError):   # Python 3.11+
+        import tomllib
         with open(path, "rb") as f:
             return tomllib.load(f)
-    except ImportError:
-        pass
-    try:
-        import toml  # installed with Streamlit
-        return toml.load(path)
-    except ImportError:
-        pass
+    with contextlib.suppress(ImportError):   # installed with Streamlit
+        import toml
+        return dict(toml.load(path))
     # Last resort for a bare Python < 3.11: flat KEY = "value" / KEY = 123 lines, which is all CareCircle uses.
     out, section = {}, None
     with open(path, encoding="utf-8") as f:
@@ -87,7 +91,7 @@ def _load_toml(path):
     return out
 
 
-def _project_secrets():
+def _project_secrets() -> dict[str, str]:
     """This app's own .streamlit/secrets.toml, read by absolute path.
 
     Streamlit only finds secrets.toml in the folder `streamlit run` is started from, so launching from another
@@ -107,7 +111,8 @@ def _project_secrets():
     return _secrets_cache["values"]
 
 
-def get(key, default=""):
+def get(key: str, default: Any = "") -> Any:
+    """A setting: environment, then .env, then this app's secrets.toml, then Streamlit secrets, then `default`."""
     _load()
     v = os.environ.get(key)
     if v:
@@ -117,17 +122,16 @@ def get(key, default=""):
     v = _project_secrets().get(key)
     if v:
         return v
-    try:  # Streamlit secrets (global ~/.streamlit or the launch folder); absent outside Streamlit
+    # Streamlit secrets (global ~/.streamlit or the launch folder); not available outside Streamlit
+    with contextlib.suppress(Exception):
         import streamlit as st
         v = st.secrets.get(key)
         if v:
             return str(v)
-    except Exception:
-        pass
     return default
 
 
-def source(key):
+def source(key: str) -> str:
     """Where a setting comes from, for diagnostics. Never returns the value."""
     _load()
     if os.environ.get(key):
@@ -137,7 +141,8 @@ def source(key):
     return "Streamlit secrets" if get(key) else "not set"
 
 
-def get_int(key, default, lo=None, hi=None):
+def get_int(key: str, default: int, lo: int | None = None, hi: int | None = None) -> int:
+    """A whole-number setting, clamped to [lo, hi]; `default` if it isn't a number."""
     try:
         v = int(str(get(key, default)).strip())
     except (TypeError, ValueError):
@@ -149,61 +154,78 @@ def get_int(key, default, lo=None, hi=None):
     return v
 
 
-def get_bool(key, default=False):
+def get_bool(key: str, default: bool = False) -> bool:
+    """A yes/no setting: 1, true, yes or on mean yes."""
     v = str(get(key, "")).strip().lower()
     if not v:
         return default
     return v in ("1", "true", "yes", "on")
 
 
-def get_list(key, default=""):
+def get_list(key: str, default: str = "") -> list[str]:
+    """A comma-separated setting as a lower-case list."""
     return [p.strip().lower() for p in str(get(key, default)).split(",") if p.strip()]
 
 
 # ---------------------------------------------------------------- profiles
-def env():
-    v = str(get("APP_ENV", "development")).strip().lower()
+def default_env() -> str:
+    """APP_ENV when it isn't set: development on your own machine, but demo on Streamlit Community Cloud.
+
+    A Community Cloud app is public, and development mode is only safe on a local machine: it shows sign-in codes on
+    screen when email isn't set up, and lets the Settings tab write server keys."""
+    return "demo" if on_community_cloud() else "development"
+
+
+def env() -> str:
+    """The environment profile: development, demo or production (anything unrecognised is production)."""
+    v = str(get("APP_ENV", default_env())).strip().lower()
     return v if v in ENVIRONMENTS else "production"
 
 
-def is_production():
+def is_production() -> bool:
+    """True when real people's data is at stake and every safety check applies."""
     return env() == "production"
 
 
-def demo_features():
+def demo_features() -> bool:
     """Sample family, time simulation and other demo-only tools."""
     return env() in ("development", "demo")
 
 
-def ui_can_save_secrets():
+def ui_can_save_secrets() -> bool:
     """Only a local development install may write credentials from the browser."""
     return env() == "development" and get_bool("ALLOW_UI_SECRETS", True)
 
 
-def on_community_cloud():
+def on_community_cloud() -> bool:
     """Streamlit Community Cloud runs apps from /mount/src/<repo>."""
     return BASE_DIR.startswith("/mount/src/")
 
 
-def db_path():
+def db_path() -> str:
+    """Where the SQLite database lives (CARECIRCLE_DB, default next to the app)."""
     return get("CARECIRCLE_DB", DEFAULT_DB)
 
 
-def mfa_roles():
+def mfa_roles() -> set[str]:
+    """Roles that must use two-step sign-in (default: caretaker in production)."""
     default = "caretaker" if is_production() else ""
     return set(get_list("MFA_ROLES", default))
 
 
-def scheduler_mode():
+def scheduler_mode() -> str:
+    """How reminders run: thread (inside the web app), external (worker.py) or off."""
     v = str(get("SCHEDULER_MODE", "thread")).strip().lower()
     return v if v in ("thread", "external", "off") else "thread"
 
 
-def scheduler_interval():
+def scheduler_interval() -> int:
+    """Seconds between reminder passes (15 to 3600)."""
     return get_int("SCHEDULER_INTERVAL_SEC", 60, lo=15, hi=3600)
 
 
-def smtp_configured():
+def smtp_configured() -> bool:
+    """True when real emails can be sent."""
     sec = get("SMTP_SECURITY", "ssl").lower()
     if sec == "none":  # local test server
         return bool(get("SMTP_HOST"))
@@ -211,11 +233,11 @@ def smtp_configured():
 
 
 # ---------------------------------------------------------------- validation
-def validate():
+def validate() -> tuple[list[str], list[str]]:
     """Return (errors, warnings). In production any error stops the app from starting."""
     errors, warnings = [], []
     prod = is_production()
-    raw_env = str(get("APP_ENV", "development")).strip().lower()
+    raw_env = str(get("APP_ENV", default_env())).strip().lower()
     if raw_env not in ENVIRONMENTS:
         warnings.append(f"APP_ENV={raw_env!r} is not recognised, so production rules apply.")
 
@@ -266,7 +288,8 @@ def validate():
     return errors, warnings
 
 
-def _secret_set(key):
+def _secret_set(key: str) -> bool:
+    """True if `key` is set in a secrets file (not the environment)."""
     if not use_secrets_files:
         return False
     if _project_secrets().get(key):
@@ -279,7 +302,7 @@ def _secret_set(key):
 
 
 # ---------------------------------------------------------------- development-only writes
-def save(values):
+def save(values: dict[str, str]) -> None:
     """Persist SMTP/Gemini settings to .env. Development only."""
     if not ui_can_save_secrets():
         raise PermissionError("Settings can only be saved from the browser in a local development install. "

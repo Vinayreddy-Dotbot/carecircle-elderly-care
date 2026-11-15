@@ -8,6 +8,8 @@ Rules this module enforces:
 - Read-modify-write operations run inside BEGIN IMMEDIATE transactions.
 - Schema changes are numbered migrations tracked with PRAGMA user_version.
 """
+from __future__ import annotations
+
 import contextlib
 import json
 import logging
@@ -15,11 +17,14 @@ import os
 import re
 import sqlite3
 import time
-from datetime import timedelta
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from datetime import date, datetime, timedelta
+from typing import Any
 
 import clock
 import config
 import crypto
+from typedefs import Row
 
 log_ = logging.getLogger("carecircle.db")
 
@@ -56,7 +61,8 @@ class NotFound(Exception):
 
 
 # ---------------------------------------------------------------- connections
-def conn():
+def conn() -> sqlite3.Connection:
+    """A new connection with foreign keys, secure delete and a busy timeout."""
     c = sqlite3.connect(config.db_path(), timeout=15, isolation_level=None, check_same_thread=False)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
@@ -67,7 +73,7 @@ def conn():
 
 
 @contextlib.contextmanager
-def tx():
+def tx() -> Iterator[sqlite3.Connection]:
     """A write transaction that takes the database write lock up front."""
     c = conn()
     try:
@@ -82,11 +88,13 @@ def tx():
         c.close()
 
 
-def _decrypt_row(row):
+def _decrypt_row(row: sqlite3.Row) -> Row:
+    """A row as a dict, with encrypted columns decrypted."""
     return {k: crypto.dec(row[k]) for k in row.keys()}
 
 
-def q(sql, args=(), c=None):
+def q(sql: str, args: Sequence[Any] = (), c: sqlite3.Connection | None = None) -> list[Row]:
+    """Run a query and return every row, decrypted."""
     own = c is None
     c = c or conn()
     try:
@@ -96,47 +104,60 @@ def q(sql, args=(), c=None):
             c.close()
 
 
-def q1(sql, args=(), c=None):
+def q1(sql: str, args: Sequence[Any] = (), c: sqlite3.Connection | None = None) -> Row | None:
+    """Run a query and return the first row, decrypted, or None."""
     rows = q(sql, args, c)
     return rows[0] if rows else None
 
 
-def x(sql, args=(), c=None):
+def count(sql: str, args: Sequence[Any] = (), c: sqlite3.Connection | None = None) -> int:
+    """Run a `SELECT COUNT(*) AS n ...` query and return n."""
+    row = q1(sql, args, c)
+    return int(row["n"]) if row else 0
+
+
+def x(sql: str, args: Sequence[Any] = (), c: sqlite3.Connection | None = None) -> int:
+    """Run a statement. Returns the new row id for an INSERT, otherwise the number of rows changed."""
     own = c is None
     c = c or conn()
     try:
         cur = c.execute(sql, args)
-        return cur.lastrowid if cur.lastrowid else cur.rowcount
+        return cur.lastrowid or cur.rowcount
     finally:
         if own:
             c.close()
 
 
-def _check_cols(cols):
+def _check_cols(cols: Iterable[str]) -> None:
+    """Refuse anything that isn't a plain lower-case identifier."""
     for col in cols:
         if not _COL.match(col):
             raise ValueError(f"bad column name {col!r}")
 
 
-def _enc_values(table, values):
+def _enc_values(table: str, values: Mapping[str, Any]) -> dict[str, Any]:
+    """Encrypt the values that belong in encrypted columns."""
     enc_cols = ENCRYPTED_COLUMNS.get(table, ())
     return {k: (crypto.enc(v) if k in enc_cols and isinstance(v, str) else v) for k, v in values.items()}
 
 
-def insert(table, values, c=None):
+def insert(table: str, values: Mapping[str, Any], c: sqlite3.Connection | None = None) -> int:
+    """Insert one row, encrypting sensitive columns. Returns the new row id."""
     _check_cols([table, *values])
     vals = _enc_values(table, values)
     sql = f"INSERT INTO {table}({','.join(vals)}) VALUES({','.join('?' * len(vals))})"
     own = c is None
     c = c or conn()
     try:
-        return c.execute(sql, tuple(vals.values())).lastrowid
+        return c.execute(sql, tuple(vals.values())).lastrowid or 0
     finally:
         if own:
             c.close()
 
 
-def update(table, values, where, args, allowed, c=None):
+def update(table: str, values: Mapping[str, Any], where: str, args: Sequence[Any], allowed: Iterable[str],
+           c: sqlite3.Connection | None = None) -> int:
+    """Update allowed columns only, encrypting sensitive ones. Returns the number of rows changed."""
     bad = set(values) - set(allowed)
     if bad:
         raise ValueError(f"cannot update {', '.join(sorted(bad))} on {table}")
@@ -242,27 +263,31 @@ CREATE INDEX IF NOT EXISTS ix_activity_family ON activity(family_id, id)
 """
 
 
-def _exec_script(c, script):
+def _exec_script(c: sqlite3.Connection, script: str) -> None:
+    """Run several statements inside the caller's transaction (executescript would commit it)."""
     for stmt in script.split(";"):
         if stmt.strip():
             c.execute(stmt)
 
 
-def _cols(c, table):
+def _cols(c: sqlite3.Connection, table: str) -> set[str]:
+    """The column names of a table."""
     return {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
 
 
-def _add_col(c, table, col, decl):
+def _add_col(c: sqlite3.Connection, table: str, col: str, decl: str) -> None:
+    """Add a column if it isn't there yet."""
     if col not in _cols(c, table):
         c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
-def _migrate_v1(c):
+def _migrate_v1(c: sqlite3.Connection) -> None:
+    """The original schema."""
     _exec_script(c, SCHEMA_V1)
     _add_col(c, "outbox", "attempts", "INTEGER DEFAULT 0")
 
 
-def _migrate_v2(c):
+def _migrate_v2(c: sqlite3.Connection) -> None:
     """Security upgrade: hashed access codes, encryption at rest, sessions, rate limits, reliable outbox."""
     import auth  # local import: auth depends on db
 
@@ -310,7 +335,8 @@ def _migrate_v2(c):
     c.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('key_check',?)", (crypto.enc("carecircle"),))
 
 
-def _encrypt_plaintext(c):
+def _encrypt_plaintext(c: sqlite3.Connection) -> None:
+    """Encrypt any sensitive values still stored in clear (from before encryption at rest)."""
     existing = {r["name"] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     for table, cols in ENCRYPTED_COLUMNS.items():
         if table not in existing:  # created by a later migration
@@ -322,7 +348,7 @@ def _encrypt_plaintext(c):
                 c.execute(f"UPDATE {table} SET {', '.join(f'{k}=?' for k in vals)} WHERE id=?", (*vals.values(), r["id"]))
 
 
-def _migrate_v3(c):
+def _migrate_v3(c: sqlite3.Connection) -> None:
     """Medicine changes made by someone other than the elder, for the elder to see, accept, dispute or approve."""
     _exec_script(c, """
 CREATE TABLE IF NOT EXISTS med_changes(
@@ -340,7 +366,8 @@ CREATE INDEX IF NOT EXISTS ix_med_changes_family ON med_changes(family_id, statu
 MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2), (3, _migrate_v3)]
 
 
-def schema_version(c=None):
+def schema_version(c: sqlite3.Connection | None = None) -> int:
+    """The schema version recorded in the database."""
     own = c is None
     c = c or conn()
     try:
@@ -350,14 +377,16 @@ def schema_version(c=None):
             c.close()
 
 
-def _has_data(c):
+def _has_data(c: sqlite3.Connection) -> bool:
+    """True if the database already holds members (so it is backed up before upgrading)."""
     try:
         return c.execute("SELECT COUNT(*) FROM members").fetchone()[0] > 0
     except sqlite3.OperationalError:
         return False
 
 
-def _restrict_permissions():
+def _restrict_permissions() -> None:
+    """Make the database files readable by this user only."""
     for suffix in ("", "-wal", "-shm"):
         p = config.db_path() + suffix
         if os.path.exists(p):
@@ -365,7 +394,7 @@ def _restrict_permissions():
                 os.chmod(p, 0o600)
 
 
-def init_db():
+def init_db() -> list[int]:
     """Create or upgrade the database. Safe to call on every start."""
     path = config.db_path()
     if not os.path.exists(path):
@@ -410,7 +439,7 @@ def init_db():
         _restrict_permissions()
 
 
-def expected_key_id(c=None):
+def expected_key_id(c: sqlite3.Connection | None = None) -> str | None:
     """The key id this database's data was first encrypted with (None for a new or pre-upgrade database)."""
     own = c is None
     c = c or conn()
@@ -424,7 +453,7 @@ def expected_key_id(c=None):
     return crypto.stored_kid(row["value"]) if row else None
 
 
-def check_key(c=None):
+def check_key(c: sqlite3.Connection | None = None) -> None:
     """Fail fast, with a message that names both keys, if the current keys can't read this database."""
     own = c is None
     c = c or conn()
@@ -444,23 +473,27 @@ def check_key(c=None):
 
 
 # ---------------------------------------------------------------- families
-def create_family(name, elder_name, is_demo=False, c=None):
+def create_family(name: str, elder_name: str, is_demo: bool = False, c: sqlite3.Connection | None = None) -> int:
+    """Create a care circle. Returns its id."""
     return insert("families", {"name": name, "elder_name": elder_name, "is_demo": int(is_demo)}, c)
 
 
-def get_family(family_id):
+def get_family(family_id: int) -> Row:
+    """One care circle, or NotFound."""
     f = q1("SELECT * FROM families WHERE id=?", (family_id,))
     if not f:
         raise NotFound("family")
     return f
 
 
-def family_ids(include_demo=True):
+def family_ids(include_demo: bool = True) -> list[int]:
+    """Every care circle's id."""
     sql = "SELECT id FROM families" + ("" if include_demo else " WHERE is_demo=0")
     return [r["id"] for r in q(sql)]
 
 
-def family_settings(family_id):
+def family_settings(family_id: int) -> dict[str, Any]:
+    """The circle's settings, with defaults for anything not set."""
     raw = get_family(family_id).get("settings") or "{}"
     try:
         stored = json.loads(raw)
@@ -469,7 +502,8 @@ def family_settings(family_id):
     return {**FAMILY_SETTINGS_DEFAULTS, **{k: v for k, v in stored.items() if k in FAMILY_SETTINGS_DEFAULTS}}
 
 
-def update_family_settings(family_id, **values):
+def update_family_settings(family_id: int, **values: Any) -> None:
+    """Change some of a circle's settings (only known settings are accepted)."""
     bad = set(values) - set(FAMILY_SETTINGS_DEFAULTS)
     if bad:
         raise ValueError(f"unknown settings: {', '.join(sorted(bad))}")
@@ -482,7 +516,7 @@ def update_family_settings(family_id, **values):
         c.execute("UPDATE families SET settings=? WHERE id=?", (json.dumps(current), family_id))
 
 
-def delete_family_rows(family_id):
+def delete_family_rows(family_id: int) -> int:
     """Remove every row belonging to a family. Returns the number of rows deleted."""
     with tx() as c:
         member_ids = [r["id"] for r in c.execute("SELECT id FROM members WHERE family_id=?", (family_id,))]
@@ -501,7 +535,9 @@ def delete_family_rows(family_id):
 MEMBER_FIELDS = {"name", "email", "email_index", "lang", "large_text", "mfa"}
 
 
-def insert_member(family_id, name, email, role, selector, code_hash, c=None):
+def insert_member(family_id: int, name: str, email: str | None, role: str, selector: str, code_hash: str,
+                  c: sqlite3.Connection | None = None) -> int:
+    """Add a member with a hashed access code. Returns the member id."""
     if role not in ROLES:
         raise ValueError("bad role")
     return insert("members", {
@@ -511,18 +547,21 @@ def insert_member(family_id, name, email, role, selector, code_hash, c=None):
     }, c)
 
 
-def get_member(member_id, c=None):
+def get_member(member_id: int, c: sqlite3.Connection | None = None) -> Row | None:
+    """A member by id, from any circle (server administration only)."""
     return q1("SELECT * FROM members WHERE id=?", (member_id,), c)
 
 
-def member_in_family(family_id, member_id):
+def member_in_family(family_id: int, member_id: int) -> Row:
+    """A member of this circle, or NotFound."""
     m = q1("SELECT * FROM members WHERE id=? AND family_id=?", (member_id, family_id))
     if not m:
         raise NotFound("member")
     return m
 
 
-def members(family_id, roles=None, with_email=False):
+def members(family_id: int, roles: Iterable[str] | None = None, with_email: bool = False) -> list[Row]:
+    """The circle's members, optionally only some roles or only those with an email."""
     rows = q("SELECT * FROM members WHERE family_id=? ORDER BY id", (family_id,))
     if roles:
         rows = [r for r in rows if r["role"] in roles]
@@ -531,7 +570,8 @@ def members(family_id, roles=None, with_email=False):
     return rows
 
 
-def update_member(family_id, member_id, **fields):
+def update_member(family_id: int, member_id: int, **fields: Any) -> None:
+    """Change a member's details (keeping the email lookup in step)."""
     if "email" in fields:
         fields["email_index"] = crypto.email_index(fields["email"])
     n = update("members", fields, "id=? AND family_id=?", (member_id, family_id), MEMBER_FIELDS)
@@ -539,7 +579,8 @@ def update_member(family_id, member_id, **fields):
         raise NotFound("member")
 
 
-def delete_member(family_id, member_id):
+def delete_member(family_id: int, member_id: int) -> None:
+    """Remove a member and end their sessions. The elder can't be removed."""
     with tx() as c:
         n = c.execute("DELETE FROM members WHERE id=? AND family_id=? AND role!='elder'", (member_id, family_id)).rowcount
         if not n:
@@ -549,21 +590,25 @@ def delete_member(family_id, member_id):
 
 
 # ---------------------------------------------------------------- activity & security log
-def log(family_id, who, what, c=None):
+def log(family_id: int, who: str, what: str, c: sqlite3.Connection | None = None) -> None:
+    """Add a line to the circle's who-did-what log."""
     insert("activity", {"family_id": family_id, "who": who, "what": what}, c)
 
 
-def activity(family_id, limit=30):
+def activity(family_id: int, limit: int = 30) -> list[Row]:
+    """The most recent who-did-what lines."""
     return q("SELECT * FROM activity WHERE family_id=? ORDER BY id DESC LIMIT ?", (family_id, limit))
 
 
-def security_event(event, family_id=None, member_id=None, detail="", c=None):
+def security_event(event: str, family_id: int | None = None, member_id: int | None = None, detail: str = "",
+                   c: sqlite3.Connection | None = None) -> None:
     """Security log. Never put codes, tokens or email addresses in `detail`."""
     insert("security_events", {"at": time.time(), "family_id": family_id, "member_id": member_id,
                                "event": event, "detail": detail[:300]}, c)
 
 
-def security_events(family_id, limit=50):
+def security_events(family_id: int, limit: int = 50) -> list[Row]:
+    """The circle's most recent security events."""
     return q("SELECT * FROM security_events WHERE family_id=? ORDER BY id DESC LIMIT ?", (family_id, limit))
 
 
@@ -572,12 +617,15 @@ MED_FIELDS = {"name", "dosage", "instructions", "times", "start_date", "end_date
               "prescriber", "verified_by", "verified_at", "updated_at"}
 
 
-def _sort_meds(rows):
+def _sort_meds(rows: list[Row]) -> list[Row]:
+    """Medicines in alphabetical order (sorted here because names are encrypted in the database)."""
     return sorted(rows, key=lambda m: (m["name"] or "").lower())
 
 
-def add_med(family_id, name, dosage, instructions, times, start, end, stock, refill_at, added_by,
-            status="active", prescriber=""):
+def add_med(family_id: int, name: str, dosage: str, instructions: str, times: Iterable[str], start: str,
+            end: str | None, stock: int | None, refill_at: int, added_by: str, status: str = "active",
+            prescriber: str = "") -> int:
+    """Add a medicine. Returns its id."""
     if status not in MED_STATUSES:
         raise ValueError("bad status")
     now = clock.now().isoformat(timespec="seconds")
@@ -588,19 +636,22 @@ def add_med(family_id, name, dosage, instructions, times, start, end, stock, ref
         "created_at": now, "updated_at": now})
 
 
-def get_med(family_id, med_id):
+def get_med(family_id: int, med_id: int) -> Row:
+    """One medicine of this circle, or NotFound."""
     m = q1("SELECT * FROM medications WHERE id=? AND family_id=?", (med_id, family_id))
     if not m:
         raise NotFound("medicine")
     return m
 
 
-def meds(family_id, statuses=("active",)):
+def meds(family_id: int, statuses: Sequence[str] = ("active",)) -> list[Row]:
+    """The circle's medicines with these statuses, alphabetically."""
     ph = ",".join("?" * len(statuses))
     return _sort_meds(q(f"SELECT * FROM medications WHERE family_id=? AND status IN ({ph})", (family_id, *statuses)))
 
 
-def update_med(family_id, med_id, **fields):
+def update_med(family_id: int, med_id: int, **fields: Any) -> None:
+    """Change a medicine's details."""
     if "status" in fields and fields["status"] not in MED_STATUSES:
         raise ValueError("bad status")
     fields.setdefault("updated_at", clock.now().isoformat(timespec="seconds"))
@@ -608,7 +659,8 @@ def update_med(family_id, med_id, **fields):
         raise NotFound("medicine")
 
 
-def stop_med(family_id, med_id):
+def stop_med(family_id: int, med_id: int) -> None:
+    """Stop a medicine and remove its doses that haven't happened yet."""
     with tx() as c:
         if not c.execute("UPDATE medications SET status='stopped', updated_at=? WHERE id=? AND family_id=?",
                          (clock.now().isoformat(timespec="seconds"), med_id, family_id)).rowcount:
@@ -616,7 +668,8 @@ def stop_med(family_id, med_id):
         c.execute("DELETE FROM doses WHERE med_id=? AND family_id=? AND status='pending'", (med_id, family_id))
 
 
-def adjust_stock(family_id, med_id, new_stock, who, reason):
+def adjust_stock(family_id: int, med_id: int, new_stock: int | None, who: str, reason: str) -> None:
+    """Set the stock count, recording the change and the reason."""
     with tx() as c:
         row = c.execute("SELECT stock FROM medications WHERE id=? AND family_id=?", (med_id, family_id)).fetchone()
         if not row:
@@ -627,44 +680,52 @@ def adjust_stock(family_id, med_id, new_stock, who, reason):
                                 "new_stock": new_stock, "reason": reason, "who": who}, c)
 
 
-def stock_events(family_id, med_id, limit=20):
+def stock_events(family_id: int, med_id: int, limit: int = 20) -> list[Row]:
+    """Recent stock changes for one medicine."""
     return q("SELECT * FROM stock_events WHERE family_id=? AND med_id=? ORDER BY id DESC LIMIT ?",
              (family_id, med_id, limit))
 
 
 # ---------------------------------------------------------------- medicine changes for the elder
-def add_change(family_id, med_id, action, before, after, by_member, by_name, status, c=None):
+def add_change(family_id: int, med_id: int, action: str, before: dict[str, Any], after: dict[str, Any],
+               by_member: int, by_name: str, status: str, c: sqlite3.Connection | None = None) -> int:
+    """Record a change someone made (or wants to make) to the elder's medicines."""
     return insert("med_changes", {"family_id": family_id, "med_id": med_id, "action": action,
                                   "before_json": json.dumps(before), "after_json": json.dumps(after),
                                   "by_member": by_member, "by_name": by_name, "status": status}, c)
 
 
-def _change_row(r):
+def _change_row(r: Row) -> Row:
+    """Turn the stored before/after JSON into dicts."""
     r["before"] = json.loads(r.pop("before_json") or "{}")
     r["after"] = json.loads(r.pop("after_json") or "{}")
     return r
 
 
-def get_change(family_id, change_id):
+def get_change(family_id: int, change_id: int) -> Row:
+    """One medicine change of this circle, or NotFound."""
     r = q1("SELECT * FROM med_changes WHERE id=? AND family_id=?", (change_id, family_id))
     if not r:
         raise NotFound("change")
     return _change_row(r)
 
 
-def changes(family_id, statuses=CHANGE_OPEN, med_id=None):
+def changes(family_id: int, statuses: Sequence[str] = CHANGE_OPEN, med_id: int | None = None) -> list[Row]:
+    """Medicine changes with these statuses, oldest first."""
     ph = ",".join("?" * len(statuses))
     sql = f"SELECT * FROM med_changes WHERE family_id=? AND status IN ({ph})"
-    args = [family_id, *statuses]
+    args: list[Any] = [family_id, *statuses]
     if med_id is not None:
         sql += " AND med_id=?"
         args.append(med_id)
     return [_change_row(r) for r in q(sql + " ORDER BY id", args)]
 
 
-def resolve_change(family_id, change_id, status, resolved_by, note="", expect=None):
+def resolve_change(family_id: int, change_id: int, status: str, resolved_by: str, note: str = "",
+                   expect: Sequence[str] | None = None) -> None:
     """Move a change to a new status. `expect` guards against two people resolving it at once."""
-    where, args = "id=? AND family_id=?", [change_id, family_id]
+    where = "id=? AND family_id=?"
+    args: list[Any] = [change_id, family_id]
     if expect:
         where += f" AND status IN ({','.join('?' * len(expect))})"
         args += list(expect)
@@ -676,7 +737,7 @@ def resolve_change(family_id, change_id, status, resolved_by, note="", expect=No
 
 
 # ---------------------------------------------------------------- doses
-def ensure_doses(family_id, day):
+def ensure_doses(family_id: int, day: str) -> None:
     """Create dose rows for every active medicine scheduled on `day` (YYYY-MM-DD)."""
     with tx() as c:
         for m in q("SELECT id, times, start_date, end_date FROM medications WHERE family_id=? AND status='active'",
@@ -688,7 +749,8 @@ def ensure_doses(family_id, day):
                           (m["id"], family_id, day, t))
 
 
-def doses_for_day(family_id, day):
+def doses_for_day(family_id: int, day: str) -> list[Row]:
+    """Every dose of an active medicine on `day`, by time."""
     ensure_doses(family_id, day)
     rows = q("""SELECT d.*, m.name, m.dosage, m.instructions FROM doses d
                 JOIN medications m ON m.id=d.med_id
@@ -696,7 +758,8 @@ def doses_for_day(family_id, day):
     return sorted(rows, key=lambda d: (d["scheduled_time"], (d["name"] or "").lower()))
 
 
-def get_dose(family_id, dose_id):
+def get_dose(family_id: int, dose_id: int) -> Row:
+    """One dose of this circle, with its medicine's name and dosage, or NotFound."""
     d = q1("""SELECT d.*, m.name, m.dosage FROM doses d JOIN medications m ON m.id=d.med_id
               WHERE d.id=? AND d.family_id=?""", (dose_id, family_id))
     if not d:
@@ -704,7 +767,7 @@ def get_dose(family_id, dose_id):
     return d
 
 
-def set_dose(family_id, dose_id, status, who, now=None):
+def set_dose(family_id: int, dose_id: int, status: str, who: str, now: datetime | None = None) -> bool:
     """Change a dose's status and keep the pill count in step, atomically.
 
     Stock is decremented at most once per dose (tracked by doses.stock_applied), so repeated clicks,
@@ -740,7 +803,7 @@ def set_dose(family_id, dose_id, status, who, now=None):
     return True
 
 
-def auto_unconfirm(family_id, dose_id, now):
+def auto_unconfirm(family_id: int, dose_id: int, now: datetime) -> int:
     """Scheduler: a pending dose past its grace period becomes 'unconfirmed' (not 'missed': nobody knows yet)."""
     return x("UPDATE doses SET status='unconfirmed', marked_by='', marked_at=? WHERE id=? AND family_id=? AND status='pending'",
              (now.isoformat(timespec="seconds"), dose_id, family_id))
@@ -750,33 +813,38 @@ def auto_unconfirm(family_id, dose_id, now):
 APPT_FIELDS = {"doctor", "specialty", "when_at", "location", "notes", "questions", "status"}
 
 
-def add_appt(family_id, doctor, specialty, when_at, location, notes, questions, added_by):
+def add_appt(family_id: int, doctor: str, specialty: str, when_at: str, location: str, notes: str,
+             questions: str, added_by: str) -> int:
+    """Add an appointment. Returns its id."""
     return insert("appointments", {"family_id": family_id, "doctor": doctor.strip(), "specialty": specialty,
                                    "when_at": when_at, "location": location, "notes": notes,
                                    "questions": questions, "added_by": added_by})
 
 
-def get_appt(family_id, appt_id):
+def get_appt(family_id: int, appt_id: int) -> Row:
+    """One appointment of this circle, or NotFound."""
     a = q1("SELECT * FROM appointments WHERE id=? AND family_id=?", (appt_id, family_id))
     if not a:
         raise NotFound("appointment")
     return a
 
 
-def appts(family_id, upcoming_only=True, now=None):
-    now = (now or clock.now()).isoformat(timespec="minutes")
+def appts(family_id: int, upcoming_only: bool = True, now: datetime | None = None) -> list[Row]:
+    """Scheduled appointments: upcoming ones soonest first, or all of them latest first."""
     if upcoming_only:
+        since = (now or clock.now()).isoformat(timespec="minutes")
         return q("SELECT * FROM appointments WHERE family_id=? AND status='scheduled' AND when_at>=? ORDER BY when_at",
-                 (family_id, now))
+                 (family_id, since))
     return q("SELECT * FROM appointments WHERE family_id=? AND status='scheduled' ORDER BY when_at DESC", (family_id,))
 
 
-def update_appt(family_id, appt_id, **fields):
+def update_appt(family_id: int, appt_id: int, **fields: Any) -> None:
+    """Change an appointment's details or status."""
     if not update("appointments", fields, "id=? AND family_id=?", (appt_id, family_id), APPT_FIELDS):
         raise NotFound("appointment")
 
 
-def append_question(family_id, appt_id, line):
+def append_question(family_id: int, appt_id: int, line: str) -> None:
     """Atomic append so two people adding questions at once don't overwrite each other."""
     with tx() as c:
         row = q1("SELECT questions FROM appointments WHERE id=? AND family_id=?", (appt_id, family_id), c)
@@ -787,19 +855,21 @@ def append_question(family_id, appt_id, line):
 
 
 # ---------------------------------------------------------------- check-ins
-def set_checkin(family_id, day, mood, note=""):
+def set_checkin(family_id: int, day: str, mood: int, note: str = "") -> None:
+    """Record (or replace) the mood check-in for a day."""
     x("""INSERT INTO checkins(family_id,day,mood,note) VALUES(?,?,?,?)
          ON CONFLICT(family_id,day) DO UPDATE SET mood=excluded.mood, note=excluded.note""",
       (family_id, day, int(mood), crypto.enc(note)))
 
 
-def checkins(family_id, days=14, today=None):
+def checkins(family_id: int, days: int = 14, today: date | None = None) -> list[Row]:
+    """Mood check-ins from the last `days` days, oldest first."""
     since = ((today or clock.today()) - timedelta(days=days)).isoformat()
     return q("SELECT * FROM checkins WHERE family_id=? AND day>=? ORDER BY day", (family_id, since))
 
 
 # ---------------------------------------------------------------- stats
-def adherence(family_id, days=7, today=None):
+def adherence(family_id: int, days: int = 7, today: date | None = None) -> dict[str, Any]:
     """Confirmed-taken rate over resolved doses. 'unconfirmed' doses count as not confirmed and are reported separately."""
     today = today or clock.today()
     start = (today - timedelta(days=days - 1)).isoformat()
@@ -807,7 +877,8 @@ def adherence(family_id, days=7, today=None):
                 WHERE d.family_id=? AND d.scheduled_date>=? AND d.scheduled_date<=? AND d.status!='pending'""",
              (family_id, start, today.isoformat()))
     taken = sum(r["status"] == "taken" for r in rows)
-    per_day, per_med = {}, {}
+    per_day: dict[str, list[int]] = {}
+    per_med: dict[str, list[int]] = {}
     for r in rows:
         d = per_day.setdefault(r["scheduled_date"], [0, 0])
         d[1] += 1
@@ -831,7 +902,8 @@ def adherence(family_id, days=7, today=None):
 
 
 # ---------------------------------------------------------------- leases & heartbeats (scheduler coordination)
-def acquire_lease(name, owner, ttl, now):
+def acquire_lease(name: str, owner: str, ttl: float, now: float) -> bool:
+    """Take or renew a named lease, unless another owner holds it. True if this owner now holds it."""
     with tx() as c:
         row = c.execute("SELECT owner, expires_at FROM leases WHERE name=?", (name,)).fetchone()
         if row and row["owner"] != owner and row["expires_at"] > now:
@@ -842,14 +914,18 @@ def acquire_lease(name, owner, ttl, now):
         return True
 
 
-def release_lease(name, owner):
+def release_lease(name: str, owner: str) -> None:
+    """Give up a lease this owner holds."""
     x("DELETE FROM leases WHERE name=? AND owner=?", (name, owner))
 
 
-def heartbeat(name, at, detail=""):
-    x("INSERT INTO heartbeats(name,at,detail) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET at=excluded.at, detail=excluded.detail",
+def heartbeat(name: str, at: float, detail: str = "") -> None:
+    """Record that a background job ran."""
+    x("INSERT INTO heartbeats(name,at,detail) VALUES(?,?,?) "
+      "ON CONFLICT(name) DO UPDATE SET at=excluded.at, detail=excluded.detail",
       (name, at, detail))
 
 
-def get_heartbeat(name):
+def get_heartbeat(name: str) -> Row | None:
+    """When a background job last ran, or None."""
     return q1("SELECT * FROM heartbeats WHERE name=?", (name,))

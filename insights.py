@@ -13,6 +13,9 @@ AI safeguards
 - Short timeouts and a circuit breaker: after repeated failures the assistant pauses for a few minutes
   instead of hanging the page.
 """
+from __future__ import annotations
+
+import contextlib
 import json
 import logging
 import re
@@ -20,6 +23,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import date
+from typing import Any
 
 import clock
 import config
@@ -28,10 +35,14 @@ import interactions
 
 log = logging.getLogger("carecircle.ai")
 MOODS = {1: "Not good", 2: "Low", 3: "Okay", 4: "Good", 5: "Great"}
+DEFAULT_REFILL_AT = 5   # refill level when a medicine has none set
+LOW_ADHERENCE = 0.7     # per-medicine confirmed rate below which a routine change is suggested
+LOW_MOOD = 2.3          # average of the last 3 check-ins at or below this is "low"
 AI_LABEL = "AI-generated. It can be wrong and is not medical advice. Check anything important with the doctor or pharmacist."
 
 
-def daily_summary(family_id, day=None, full=True):
+def daily_summary(family_id: int, day: date | None = None, full: bool = True) -> str:
+    """A plain-text summary of one day: doses, mood, next appointment and refills. `full=False` leaves out names."""
     day = day or clock.today()
     fam = db.get_family(family_id)
     elder = fam["elder_name"]
@@ -59,13 +70,14 @@ def daily_summary(family_id, day=None, full=True):
             lines.append(f"  - {len(pending)} still to come")
     ck = [c for c in db.checkins(family_id, 1, today=day) if c["day"] == day.isoformat()]
     if ck:
-        lines.append(f"Mood check-in: {MOODS.get(ck[0]['mood'], '?')}" + (f" - \"{ck[0]['note']}\"" if full and ck[0]["note"] else ""))
+        note = f" - \"{ck[0]['note']}\"" if full and ck[0]["note"] else ""
+        lines.append(f"Mood check-in: {MOODS.get(ck[0]['mood'], '?')}{note}")
     else:
         lines.append("Mood check-in: not done yet.")
     nxt = db.appts(family_id)[:1]
     if nxt:
         lines.append(f"Next appointment: {nxt[0]['doctor'] + ' on ' if full else ''}{nxt[0]['when_at'].replace('T', ' ')}")
-    low = [m for m in db.meds(family_id) if m["stock"] is not None and m["stock"] <= (m["refill_at"] or 5)]
+    low = [m for m in db.meds(family_id) if m["stock"] is not None and m["stock"] <= (m["refill_at"] or DEFAULT_REFILL_AT)]
     if full:
         for m in low:
             lines.append(f"Refill soon: {m['name']} ({m['stock']} left)")
@@ -76,7 +88,7 @@ def daily_summary(family_id, day=None, full=True):
     return "\n".join(lines)
 
 
-def weekly_insights(family_id):
+def weekly_insights(family_id: int) -> list[str]:
     """Short observations a caregiver would want to know."""
     a = db.adherence(family_id, 7)
     out = []
@@ -85,27 +97,20 @@ def weekly_insights(family_id):
     else:
         out.append(f"{a['pct']}% of doses in the last 7 days were confirmed taken.")
         if a["unconfirmed"]:
-            out.append(f"{a['unconfirmed']} dose(s) were never confirmed. They may have been taken without anyone tapping 'Taken'.")
+            out.append(f"{a['unconfirmed']} dose(s) were never confirmed. "
+                       "They may have been taken without anyone tapping 'Taken'.")
         if a["streak"] >= 2:
             out.append(f"{a['streak']}-day streak of confirming every dose.")
-        for name, (t, n) in a["per_med"].items():
-            if n >= 3 and t / n < 0.7:
-                out.append(f"{name} is often not confirmed ({t}/{n}). Consider moving it to a time that fits the daily routine.")
-        rows = db.q("SELECT scheduled_time, status FROM doses WHERE family_id=? AND status IN ('taken','missed','unconfirmed')",
-                    (family_id,))
-        buckets = {}
-        for r in rows:
-            h = int(r["scheduled_time"][:2])
-            b = "morning" if h < 12 else "afternoon" if h < 17 else "evening"
-            t = buckets.setdefault(b, [0, 0])
-            t[1] += 1
-            t[0] += r["status"] == "taken"
-        weak = [(b, t[0] / t[1]) for b, t in buckets.items() if t[1] >= 3]
-        if len(weak) > 1:
-            b, r = min(weak, key=lambda w: w[1])
-            out.append(f"{b.capitalize()} doses are the hardest to keep up with ({round(r * 100)}% confirmed).")
+        for name, (taken, total) in a["per_med"].items():
+            if total >= 3 and taken / total < LOW_ADHERENCE:
+                out.append(f"{name} is often not confirmed ({taken}/{total}). "
+                           "Consider moving it to a time that fits the daily routine.")
+        weakest = _weakest_time_of_day(family_id)
+        if weakest:
+            part, rate = weakest
+            out.append(f"{part.capitalize()} doses are the hardest to keep up with ({round(rate * 100)}% confirmed).")
     cks = db.checkins(family_id, 7)
-    if len(cks) >= 3 and sum(c["mood"] for c in cks[-3:]) / 3 <= 2.3:
+    if len(cks) >= 3 and sum(c["mood"] for c in cks[-3:]) / 3 <= LOW_MOOD:
         out.append("Mood has been low for the last few check-ins - worth a call or a mention to the doctor.")
     res = interactions.check_all([m["name"] for m in db.meds(family_id)])
     for w in res.warnings:
@@ -115,17 +120,39 @@ def weekly_insights(family_id):
     return out
 
 
+def _weakest_time_of_day(family_id: int) -> tuple[str, float] | None:
+    """The part of the day (morning, afternoon, evening) with the lowest confirmed rate, when there is a real
+    difference to report: at least two parts of the day with 3 or more resolved doses each."""
+    rows = db.q("SELECT scheduled_time, status FROM doses WHERE family_id=? AND status IN ('taken','missed','unconfirmed')",
+                (family_id,))
+    buckets: dict[str, list[int]] = {}
+    for r in rows:
+        hour = int(r["scheduled_time"][:2])
+        part = "morning" if hour < 12 else "afternoon" if hour < 17 else "evening"
+        counts = buckets.setdefault(part, [0, 0])
+        counts[1] += 1
+        counts[0] += r["status"] == "taken"
+    rates = [(part, taken / total) for part, (taken, total) in buckets.items() if total >= 3]
+    return min(rates, key=lambda w: w[1]) if len(rates) > 1 else None
+
+
 # ---------------------------------------------------------------- AI availability
-_model_cache = {}
-_breaker = {"failures": 0, "open_until": 0.0, "last_error": ""}
+_model_cache: dict[str, Any] = {}   # chosen model ("m"), discovered "candidates", "unavailable", "busy_until"
+_breaker: dict[str, Any] = {"failures": 0, "open_until": 0.0, "last_error": ""}
 _breaker_lock = threading.Lock()
 
 
-def gemini_configured():
+def reset_model_cache() -> None:
+    """Forget which Gemini models were found, e.g. after the API key changes."""
+    _model_cache.clear()
+
+
+def gemini_configured() -> bool:
+    """True when a Gemini API key is set."""
     return bool(config.get("GEMINI_API_KEY"))
 
 
-def ai_status(family_id=None):
+def ai_status(family_id: int | None = None) -> tuple[bool, str]:
     """(available, reason). Reason is shown to the user when unavailable."""
     if not config.get_bool("AI_ENABLED", True):
         return False, "The AI assistant is switched off on this server."
@@ -142,11 +169,13 @@ def ai_status(family_id=None):
     return True, ""
 
 
-def _base():
+def _base() -> str:
+    """The Gemini API base URL."""
     return config.get("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com").rstrip("/")
 
 
-def _call(path, payload=None, timeout=20):
+def _call(path: str, payload: dict[str, Any] | None = None, timeout: float = 20) -> Any:
+    """One HTTPS request to the Gemini API (GET without payload, POST with). Returns the decoded JSON."""
     req = urllib.request.Request(  # nosec B310 - fixed https base URL
         _base() + path, data=None if payload is None else json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "x-goog-api-key": config.get("GEMINI_API_KEY")})
@@ -161,19 +190,20 @@ RETRYABLE = {500, 502, 503, 504}   # Google-side overload or outage: worth retry
 BUSY_SECONDS = 300
 
 
-def _ranked(names):
+def _ranked(names: list[str]) -> list[str]:
     """Models worth trying, best first: stable numbered Flash models newest first, then the 'latest' alias,
     then the newest stable Flash-Lite (lighter, often less busy)."""
-    def ver(n, pat):
+    def ver(n: str, pat: re.Pattern[str]) -> tuple[int, int] | None:
+        """(major, minor) version of a model name matching `pat`, else None."""
         m = pat.match(n)
         return (int(m.group(1)), int(m.group(2))) if m else None
-    stable = sorted((n for n in names if ver(n, _FLASH)), key=lambda n: ver(n, _FLASH), reverse=True)
-    lite = sorted((n for n in names if ver(n, _FLASH_LITE)), key=lambda n: ver(n, _FLASH_LITE), reverse=True)
+    stable = sorted((n for n in names if ver(n, _FLASH)), key=lambda n: ver(n, _FLASH) or (0, 0), reverse=True)
+    lite = sorted((n for n in names if ver(n, _FLASH_LITE)), key=lambda n: ver(n, _FLASH_LITE) or (0, 0), reverse=True)
     out = stable + ([DEFAULT_MODEL] if DEFAULT_MODEL in names else []) + lite[:1]
     return out or [DEFAULT_MODEL]
 
 
-def _best_flash(names, avoid=()):
+def _best_flash(names: list[str], avoid: Iterable[str] = ()) -> str | None:
     """Newest stable numbered Flash model (e.g. gemini-3.6-flash), else the 'latest' alias."""
     for n in _ranked([n for n in names if n not in avoid]):
         if not _FLASH_LITE.match(n):
@@ -181,7 +211,7 @@ def _best_flash(names, avoid=()):
     return DEFAULT_MODEL if DEFAULT_MODEL not in avoid else None
 
 
-def _discover():
+def _discover() -> list[str]:
     """Ask Google which models this key can use (once per process)."""
     if "candidates" not in _model_cache:
         try:
@@ -193,7 +223,7 @@ def _discover():
     return _model_cache["candidates"]
 
 
-def _pick_model():
+def _pick_model() -> str:
     """GEMINI_MODEL if set and still available, otherwise the newest Flash model this key can use.
     Google shuts old models down (gemini-2.0-flash stopped on 1 June 2026), so a pinned name can go stale."""
     if "m" in _model_cache:
@@ -208,7 +238,7 @@ def _pick_model():
     return name
 
 
-def _models_to_try(limit=3):
+def _models_to_try(limit: int = 3) -> list[str]:
     """The usual model first, then fallbacks; models that were overloaded in the last few minutes go last."""
     primary = _pick_model()
     unavailable = _model_cache.get("unavailable", set())
@@ -220,29 +250,30 @@ def _models_to_try(limit=3):
     return order[:limit]
 
 
-def _google_error(e):
+def _google_error(e: urllib.error.HTTPError) -> tuple[str, str]:
     """Google's own error message and reason from an HTTPError, with the key scrubbed."""
     msg, reason = "", ""
-    try:
+    with contextlib.suppress(Exception):   # not JSON (e.g. a proxy's HTML page): fall back to the status code alone
         err = json.loads(e.read().decode("utf-8", "replace")).get("error", {})
         msg = str(err.get("message", ""))
         reason = next((d.get("reason") for d in err.get("details", []) if isinstance(d, dict) and d.get("reason")), "") \
             or str(err.get("status", ""))
-    except Exception:
-        pass
     key = config.get("GEMINI_API_KEY")
     if key and len(key) >= 8:   # never echo the key back, but don't mangle text with a too-short "key"
         msg = msg.replace(key, "[key]")
     return msg[:300], reason
 
 
-def _explain(code, msg, reason, model):
+def _explain(code: int, msg: str, reason: str, model: str) -> str:
+    """Turn a Gemini HTTP error into a message that says what to do about it."""
     if code == 404:
-        return f"Google says the model '{model}' isn't available ({msg or 'not found'}). Remove GEMINI_MODEL or set a current model."
+        return (f"Google says the model '{model}' isn't available ({msg or 'not found'}). "
+                "Remove GEMINI_MODEL or set a current model.")
     if code in (400, 401, 403) and ("API_KEY" in reason or "TOKEN" in reason or "key" in msg.lower()
                                     or "credential" in msg.lower() or code == 401):
+        new_key_type = "TOKEN_TYPE" in reason or "OAuth" in msg
         hint = (" Some new keys starting with 'AQ.' are rejected this way: try a key from a Google Cloud project with "
-                "billing enabled, or create the key again in Google AI Studio." if "TOKEN_TYPE" in reason or "OAuth" in msg else "")
+                "billing enabled, or create the key again in Google AI Studio." if new_key_type else "")
         return f"Google rejected the API key (HTTP {code}{', ' + reason if reason else ''}): {msg}.{hint}"
     if code in RETRYABLE:
         return f"Google's Gemini service is busy or unavailable (HTTP {code}): {msg} This is usually temporary."
@@ -251,7 +282,8 @@ def _explain(code, msg, reason, model):
     return f"The AI service returned an error (HTTP {code}{', ' + reason if reason else ''}): {msg or 'no details'}."
 
 
-def _record(ok):
+def _record(ok: bool) -> None:
+    """Count a success or failure; three failures in a row pause the assistant for 5 minutes."""
     with _breaker_lock:
         if ok:
             _breaker["failures"] = 0
@@ -267,7 +299,7 @@ PER_MODEL_SECONDS = 25  # a model slower than this is probably overloaded: try t
 _GEN = re.compile(r"^gemini-(\d+)\.")
 
 
-def _thinking(model):
+def _thinking(model: str) -> dict[str, Any] | None:
     """Quick answers: newer models 'think' at full depth unless told otherwise, which is slow.
     Gemini 3+ takes thinkingLevel, Gemini 2.5 takes thinkingBudget; sending the wrong one is an error."""
     m = _GEN.match(model)
@@ -278,17 +310,19 @@ def _thinking(model):
     return None   # unknown (e.g. an alias): leave the model's default
 
 
-def _payload(prompt, system, thinking):
-    cfg = {"temperature": 0.2, "maxOutputTokens": 1024}   # thinking tokens count towards this
+def _payload(prompt: str, system: str | None, thinking: dict[str, Any] | None) -> dict[str, Any]:
+    """The generateContent request body: low temperature, a token limit and the safety instructions."""
+    cfg: dict[str, Any] = {"temperature": 0.2, "maxOutputTokens": 1024}   # thinking tokens count towards this
     if thinking:
         cfg["thinkingConfig"] = thinking
-    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": cfg}
+    payload: dict[str, Any] = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": cfg}
     if system:
         payload["systemInstruction"] = {"parts": [{"text": system}]}
     return payload
 
 
-def _answer_text(data):
+def _answer_text(data: dict[str, Any]) -> str:
+    """The answer's text without the model's 'thought' parts. Raises KeyError for an empty answer."""
     parts = data["candidates"][0]["content"]["parts"]
     text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
     if not text.strip():
@@ -296,74 +330,119 @@ def _answer_text(data):
     return text
 
 
-def _is_timeout(e):
+def _is_timeout(e: BaseException) -> bool:
+    """True if the request timed out."""
     return isinstance(e, TimeoutError) or (isinstance(e, urllib.error.URLError) and isinstance(e.reason, TimeoutError))
 
 
-def generate(prompt, system=None):
-    """Low-level call. Returns (text, error)."""
+MIN_ATTEMPT_SECONDS = 5   # don't start a request with less time than this left
+BUSY_RETRY_SECONDS = 1.5  # pause before the one quick retry of a busy model
+EMPTY_ANSWER = "The AI service sent back an empty answer (it may have been blocked by Google's safety filters)."
+
+
+@dataclass
+class _Outcome:
+    """What happened when one model was asked."""
+
+    text: str | None = None   # the answer, when it worked
+    error: str = ""           # what went wrong, in words the user can act on
+    final: bool = False       # stop here: another model won't help (key, quota or request problem)
+
+
+def _mark_unavailable(model: str) -> None:
+    """A retired or renamed model: never use it again in this process."""
+    _model_cache.setdefault("unavailable", set()).add(model)
+    if _model_cache.get("m") == model:
+        _model_cache.pop("m")
+    log.warning("gemini model unavailable", extra={"model": model})
+
+
+def _mark_busy(model: str) -> None:
+    """An overloaded or slow model goes to the back of the queue for BUSY_SECONDS."""
+    _model_cache.setdefault("busy_until", {})[model] = time.time() + BUSY_SECONDS
+
+
+def _promote(model: str) -> None:
+    """If the usual model is gone, make the one that just answered the default."""
+    usual = _model_cache.get("m")
+    if model != usual and usual in _model_cache.get("unavailable", set()) | {None}:
+        _model_cache["m"] = model
+
+
+def _give_up(error: str) -> _Outcome:
+    """Count a failure towards the circuit breaker and stop trying other models."""
+    _record(False)
+    _breaker["last_error"] = error
+    return _Outcome(error=error, final=True)
+
+
+def _try_model(model: str, prompt: str, system: str | None, deadline: float, retry_busy: bool) -> _Outcome:
+    """Ask one model, retrying once when that can help (a busy first model, or an unsupported thinking setting)."""
+    thinking = _thinking(model)
+    last = ""
+    for attempt in (1, 2):
+        remaining = deadline - time.time()
+        if remaining < MIN_ATTEMPT_SECONDS:
+            break
+        try:
+            text = _answer_text(_call(f"/v1beta/models/{model}:generateContent", _payload(prompt, system, thinking),
+                                      timeout=min(PER_MODEL_SECONDS, remaining)))
+        except urllib.error.HTTPError as e:
+            msg, reason = _google_error(e)
+            last = _explain(e.code, msg, reason, model)
+            if e.code == 400 and thinking and "think" in msg.lower() and attempt == 1:
+                thinking = None            # this model doesn't take that setting: ask again without it
+                continue
+            if e.code == 404:
+                _mark_unavailable(model)
+                break
+            if e.code in RETRYABLE:        # busy: one quick retry, then move to the next model
+                if attempt == 1 and retry_busy:
+                    time.sleep(BUSY_RETRY_SECONDS)
+                    continue
+                _mark_busy(model)
+                log.warning("gemini model busy", extra={"status": e.code, "model": model})
+                break
+            log.warning("gemini http error", extra={"status": e.code, "reason": reason, "model": model})
+            return _give_up(last)
+        except (KeyError, IndexError, TypeError):
+            _record(False)
+            return _Outcome(error=EMPTY_ANSWER, final=True)
+        except Exception as e:
+            if _is_timeout(e):             # too slow right now: treat like busy and try the next model
+                _mark_busy(model)
+                log.warning("gemini timeout", extra={"model": model})
+                return _Outcome(error=f"Gemini ({model}) took too long to answer.")
+            log.warning("gemini call failed", extra={"error": type(e).__name__})
+            return _give_up(f"The AI service could not be reached ({type(e).__name__}).")
+        _promote(model)
+        _record(True)
+        return _Outcome(text=text)
+    return _Outcome(error=last)
+
+
+def generate(prompt: str, system: str | None = None) -> tuple[str | None, str]:
+    """Ask Gemini, falling back to other models when one is retired, busy or slow. Returns (text, error)."""
     if not gemini_configured():
         return None, "No Gemini API key is configured."
     if time.time() < _breaker["open_until"]:
         return None, "The AI service is paused for a few minutes after repeated failures."
     deadline = time.time() + TOTAL_SECONDS
-    tried, last = [], ""
+    tried: list[str] = []
+    last = ""
     for model in _models_to_try():
-        thinking = _thinking(model)
-        for attempt in (1, 2):
-            remaining = deadline - time.time()
-            if remaining < 5:
-                break
-            try:
-                data = _call(f"/v1beta/models/{model}:generateContent", _payload(prompt, system, thinking),
-                             timeout=min(PER_MODEL_SECONDS, remaining))
-                text = _answer_text(data)
-            except urllib.error.HTTPError as e:
-                msg, reason = _google_error(e)
-                last = _explain(e.code, msg, reason, model)
-                if e.code == 400 and thinking and "think" in msg.lower() and attempt == 1:
-                    thinking = None            # this model doesn't take that setting: ask again without it
-                    continue
-                if e.code == 404:              # retired or renamed: never use it again in this process
-                    _model_cache.setdefault("unavailable", set()).add(model)
-                    if _model_cache.get("m") == model:
-                        _model_cache.pop("m")
-                    log.warning("gemini model unavailable", extra={"model": model})
-                    break
-                if e.code in RETRYABLE:        # busy: one quick retry, then move to the next model
-                    if attempt == 1 and not tried:
-                        time.sleep(1.5)
-                        continue
-                    _model_cache.setdefault("busy_until", {})[model] = time.time() + BUSY_SECONDS
-                    log.warning("gemini model busy", extra={"status": e.code, "model": model})
-                    break
-                _record(False)                 # key, quota or request problem: another model won't help
-                log.warning("gemini http error", extra={"status": e.code, "reason": reason, "model": model})
-                _breaker["last_error"] = last
-                return None, last
-            except (KeyError, IndexError, TypeError):
-                _record(False)
-                return None, "The AI service sent back an empty answer (it may have been blocked by Google's safety filters)."
-            except Exception as e:
-                if _is_timeout(e):             # too slow right now: treat like busy and try the next model
-                    _model_cache.setdefault("busy_until", {})[model] = time.time() + BUSY_SECONDS
-                    last = f"Gemini ({model}) took too long to answer."
-                    log.warning("gemini timeout", extra={"model": model})
-                    break
-                _record(False)
-                log.warning("gemini call failed", extra={"error": type(e).__name__})
-                _breaker["last_error"] = f"The AI service could not be reached ({type(e).__name__})."
-                return None, _breaker["last_error"]
-            else:
-                if model != _model_cache.get("m") and _model_cache.get("m") in _model_cache.get("unavailable", set()) | {None}:
-                    _model_cache["m"] = model   # the usual model is gone: make this one the default
-                _record(True)
-                return text, ""
+        outcome = _try_model(model, prompt, system, deadline, retry_busy=not tried)
+        if outcome.text is not None:
+            return outcome.text, ""
+        if outcome.final:
+            return None, outcome.error
+        last = outcome.error or last
         tried.append(model)
-        if deadline - time.time() < 5:
+        if deadline - time.time() < MIN_ATTEMPT_SECONDS:
             break
     _record(False)
-    if tried and all(_model_cache.get("busy_until", {}).get(m, 0) > time.time() for m in tried):
+    busy = _model_cache.get("busy_until", {})
+    if tried and all(busy.get(m, 0) > time.time() for m in tried):
         last = (f"Google's Gemini service is busy or slow right now (tried {', '.join(tried)}). "
                 "This is usually temporary: please try again in a minute or two.")
     _breaker["last_error"] = last or "No usable Gemini model was found for this key."
@@ -382,7 +461,7 @@ REDACTIONS = [  # order matters: phone numbers before long digit runs (ID / card
 ]
 
 
-def redact(text, family_id=None):
+def redact(text: str, family_id: int | None = None) -> tuple[str, list[str]]:
     """Remove personal details from a question before it leaves the server. Returns (clean_text, removed_kinds)."""
     removed = []
     for label, pat in REDACTIONS:
@@ -397,14 +476,14 @@ def redact(text, family_id=None):
             for part in re.split(r"[\s()]+", full or ""):
                 if len(part) >= 3 and part.lower() not in ("son", "daughter", "dr.", "mrs", "mr.", "the"):
                     names.add(part)
-        for n in sorted(names, key=len, reverse=True):
-            text, k = re.subn(r"\b" + re.escape(n) + r"\b", "[name]", text, flags=re.I)
+        for name in sorted(names, key=len, reverse=True):   # longest first, so "Asha Sharma" isn't left half-done
+            text, k = re.subn(r"\b" + re.escape(name) + r"\b", "[name]", text, flags=re.I)
             if k and "name" not in removed:
                 removed.append("name")
     return text, removed
 
 
-def _context(family_id):
+def _context(family_id: int) -> str:
     """Only what the assistant needs: no people, doctors, places or notes."""
     a = db.adherence(family_id, 7)
     lines = ["Medicines:"]
@@ -431,11 +510,12 @@ DOSE_CHANGE = re.compile(r"\b(increase|decrease|reduce|lower|raise|double|halve|
 AMOUNT = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|µg|g|ml|iu|units?)\b", re.I)
 
 
-def check_answer(text, family_id):
+def check_answer(text: str, family_id: int) -> list[str]:
     """Return a list of warnings about an AI answer."""
     flags = []
     if DOSE_CHANGE.search(text):
-        flags.append("This answer talks about changing a dose. Do not change any medicine without asking the doctor or pharmacist.")
+        flags.append("This answer talks about changing a dose. "
+                     "Do not change any medicine without asking the doctor or pharmacist.")
     plan = " ".join(f"{m['dosage']} {m['name']}" for m in db.meds(family_id)).lower()
     known = {(float(v), u.lower()) for v, u in AMOUNT.findall(plan)}
     for v, u in AMOUNT.findall(text):
@@ -445,13 +525,14 @@ def check_answer(text, family_id):
     return flags
 
 
-def ask(question, family_id):
+def ask(question: str, family_id: int) -> dict[str, Any]:
     """Answer a caregiver's question about the care plan. Returns dict(text, error, flags, removed, urgent)."""
-    out = {"text": None, "error": "", "flags": [], "removed": [], "urgent": False}
+    out: dict[str, Any] = {"text": None, "error": "", "flags": [], "removed": [], "urgent": False}
     if URGENT.search(question or ""):
         out["urgent"] = True
         out["error"] = (f"This sounds urgent. Call the doctor now, or the emergency number "
-                        f"({config.get('EMERGENCY_NUMBER', '112')}) if it is an emergency. CareCircle's assistant can't help with emergencies.")
+                        f"({config.get('EMERGENCY_NUMBER', '112')}) if it is an emergency. "
+                        "CareCircle's assistant can't help with emergencies.")
         return out
     ok, why = ai_status(family_id)
     if not ok:
@@ -465,11 +546,12 @@ def ask(question, family_id):
     return out
 
 
-def explain_medicines(family_id):
+def explain_medicines(family_id: int) -> dict[str, Any]:
     """Simple explanation for the elder. Falls back to the plain schedule. Returns dict like ask()."""
     meds = db.meds(family_id)
     plain = "\n".join(f"- {m['name']} {m['dosage']}: {m['times'].replace(',', ', ')} {m['instructions']}".rstrip() for m in meds)
-    out = {"text": plain or "No medicines yet.", "error": "", "flags": [], "removed": [], "urgent": False, "ai": False}
+    out: dict[str, Any] = {"text": plain or "No medicines yet.", "error": "", "flags": [], "removed": [], "urgent": False,
+                           "ai": False}
     if not meds:
         return out
     ok, why = ai_status(family_id)

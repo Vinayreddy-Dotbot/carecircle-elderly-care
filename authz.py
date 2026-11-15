@@ -1,5 +1,10 @@
 """Who may do what. Checked in services.py on every operation, independently of what the UI shows."""
 
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
 EDITOR = {
     "view", "dose.mark", "med.add", "med.suggest", "med.edit", "med.stop", "med.approve", "med.verify",
     "stock.adjust", "appt.add", "appt.edit", "appt.question", "member.view_contact", "member.invite",
@@ -21,10 +26,14 @@ class Forbidden(Exception):
     pass
 
 
-def can(actor, perm):
-    return bool(actor) and perm in PERMISSIONS.get(actor.get("role"), set())
+def can(actor: Mapping[str, Any] | None, perm: str) -> bool:
+    """True if this person's role includes the permission."""
+    if not actor:
+        return False
+    return perm in PERMISSIONS.get(str(actor.get("role")), set())
 
 
-def require(actor, perm):
+def require(actor: Mapping[str, Any] | None, perm: str) -> None:
+    """Raise Forbidden unless this person's role includes the permission."""
     if not can(actor, perm):
         raise Forbidden(f"Your role ({(actor or {}).get('role', 'signed out')}) can't do that.")

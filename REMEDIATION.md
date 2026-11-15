@@ -7,7 +7,7 @@ Response to the 65-item review. Each item is marked:
 - **Limitation**: can't be solved in code alone (needs a licensed data source, real users, or is inherent). The app
   now says so where it matters.
 
-**Totals: 40 fixed, 19 mitigated, 6 limitations.** Test suite: 184 tests. 177 pass here; the 7 in
+**Totals: 40 fixed, 19 mitigated, 6 limitations.** Test suite: 301 tests. 294 pass here; the 7 in
 `tests/test_app_streamlit.py` use Streamlit's own AppTest and are skipped when Streamlit isn't installed.
 Eleven further problems found during the work are at the end.
 
@@ -99,7 +99,7 @@ Eleven further problems found during the work are at the end.
 ## 8. Code quality and testing
 | # | Issue | Status | What changed |
 |---|---|---|---|
-| 58 | No test suite | Fixed | 184 tests in `tests/` (`pytest`). |
+| 58 | No test suite | Fixed | 301 tests in `tests/` (`pytest`), plus mypy type checking in CI. |
 | 59 | No security testing | Fixed | Tests for hashing, brute force, lockout, MFA, session expiry, cross-family access, column injection, HTML/link escaping, email header injection, encryption at rest and key rotation; `bandit` and `pip-audit` in CI. No external penetration test yet. |
 | 60 | No end-to-end testing | Fixed | Full journey test (add → suggest → approve → reminder → confirm → alert → summary); UI flows run through a Streamlit stand-in; `test_app_streamlit.py` repeats key flows with Streamlit's AppTest. |
 | 61 | No concurrency testing | Fixed | Concurrent dose marking, question appends and dispatching; WAL and `BEGIN IMMEDIATE` transactions. |

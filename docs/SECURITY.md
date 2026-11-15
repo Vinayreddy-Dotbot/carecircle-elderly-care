@@ -13,6 +13,7 @@ details for their family. The main threats it is designed against:
 | A removed or compromised member keeps access | Server-side sessions re-validated on every page load; removal, code reset and "sign out on all devices" end sessions immediately |
 | Stolen caretaker code | Two-step sign-in (emailed code) required for caretakers in production |
 | Health details leaking through email or AI | Minimal email content by default; sign-in codes never stored; AI opt-in, minimised context, redaction, paid tier required in production |
+| A public demo deployed with development settings | On Streamlit Community Cloud the default is demo mode (no on-screen sign-in codes, no key editing from the browser); visitors never see tracebacks (`.streamlit/config.toml`) |
 
 Known limits: emailed one-time codes are weaker than an authenticator app or passkeys (they fall with the email
 account). The per-IP limit is a soft signal (shared or spoofed IPs). There has been no external penetration test.

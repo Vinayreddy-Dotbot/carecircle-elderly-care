@@ -59,6 +59,10 @@ so the old plaintext is gone; each person is asked to take a new 12-character co
 Use `.streamlit/secrets.toml.example` as a template in the app's Secrets settings, with `APP_ENV = "demo"` and
 `SCHEDULER_MODE = "thread"`. Everything is lost on reboot, which is fine for sample data only.
 
+If `APP_ENV` isn't set, CareCircle detects Community Cloud and runs in demo mode anyway: development mode is only
+safe on your own machine (it shows sign-in codes on screen when email isn't set up, and lets the Settings tab write
+server keys). `.streamlit/config.toml` hides error details and developer options from visitors.
+
 ## Load and multi-user testing
 `tests/test_flows.py::test_many_people_at_once` runs 20 simultaneous users against one database. Before a real
 launch, also test with real browsers against your host (for example Locust or k6 driving the Streamlit URL), since

@@ -16,6 +16,9 @@ Privacy
   A family can switch to "full" detail in Settings.
 - Sign-in codes are sent directly and never stored: the outbox keeps only a redacted record.
 """
+from __future__ import annotations
+
+import contextlib
 import html
 import logging
 import os
@@ -26,6 +29,8 @@ import ssl
 import threading
 import time
 import uuid
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -34,6 +39,7 @@ import clock
 import config
 import crypto
 import db
+from typedefs import Member, Notice, Row
 
 log = logging.getLogger("carecircle.notifier")
 
@@ -41,33 +47,43 @@ LEAD_MIN = 15          # remind this many minutes before a dose
 GRACE_MIN = 30         # a dose becomes "unconfirmed" this long after its time
 STALE_MIN = 360        # don't alert about unconfirmed doses older than this (app was off)
 DIGEST_HOUR = 20       # evening summary for family
+APPT_SOON_HOURS = 2    # the "in under 2 hours" appointment reminder
+APPT_DAY_HOURS = 24    # the "tomorrow" appointment reminder
+DEFAULT_REFILL_AT = 5  # refill level when a medicine has none set
+HELP_BUCKET_SEC = 300  # repeated presses of "I need help" within 5 minutes send one alert
 CLAIM_SEC = 120
 EMAIL_RE = re.compile(r"^[^@\s<>,;:\"]+@[^@\s<>,;:\"]+\.[^@\s<>,;:\"]{2,}$")
 TEST_DOMAINS = ("@example.com", "@example.org", "@example.net", ".test", ".invalid")
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:6]}"
 
 
-def max_attempts():
+def max_attempts() -> int:
+    """How many times an email is tried before it is marked undeliverable."""
     return config.get_int("EMAIL_MAX_ATTEMPTS", 5, lo=1, hi=20)
 
 
-def backoff(attempts):
+def backoff(attempts: int) -> float:
+    """Seconds before the next try: 1, 2, 4... minutes, at most an hour."""
     return min(60 * 2 ** max(0, attempts - 1), 3600)
 
 
-def valid_email(e):
+def valid_email(e: str | None) -> bool:
+    """A plausible single email address (no lists, no header tricks)."""
     return bool(e and len(e) <= 254 and EMAIL_RE.match(e.strip()))
 
 
-def smtp_configured():
+def smtp_configured() -> bool:
+    """True when real emails can be sent."""
     return config.smtp_configured()
 
 
-def _is_test_address(to):
+def _is_test_address(to: str | None) -> bool:
+    """Example and test domains are never really emailed."""
     return (to or "").lower().endswith(TEST_DOMAINS)
 
 
-def _html(body):
+def _html(body: str) -> str:
+    """A simple, readable HTML version of a plain-text email (large font, escaped text)."""
     safe = html.escape(body).replace("\n", "<br>")
     return (f"<div style='font-family:Arial,sans-serif;font-size:18px;line-height:1.5;max-width:560px'>"
             f"<div style='background:#2563eb;color:#fff;padding:10px 16px;border-radius:10px 10px 0 0;font-weight:bold'>"
@@ -75,7 +91,8 @@ def _html(body):
             f"{safe}</div></div>")
 
 
-def _send_smtp(to, subject, body):
+def _send_smtp(to: str, subject: str, body: str) -> None:
+    """Send one email over SMTP (SSL, STARTTLS or plain for a local test server)."""
     user = config.get("SMTP_USER")
     msg = EmailMessage()
     msg["From"] = formataddr(("CareCircle", config.get("SMTP_FROM") or user or "carecircle@localhost"))
@@ -87,6 +104,7 @@ def _send_smtp(to, subject, body):
     sec = config.get("SMTP_SECURITY", "ssl").lower()
     ctx = ssl.create_default_context()
     timeout = config.get_int("SMTP_TIMEOUT_SEC", 20, lo=5, hi=120)
+    server: smtplib.SMTP
     if sec == "ssl":
         server = smtplib.SMTP_SSL(host, int(config.get("SMTP_PORT", "465")), timeout=timeout, context=ctx)
     else:
@@ -98,33 +116,47 @@ def _send_smtp(to, subject, body):
             server.login(user, config.get("SMTP_PASS").replace(" ", ""))  # Gmail shows app passwords with spaces
         server.send_message(msg)
     finally:
-        try:
+        with contextlib.suppress(Exception):   # the message is already sent; a failed goodbye doesn't matter
             server.quit()
-        except Exception:
-            pass
 
 
-def _describe(e):
+def _describe(e: BaseException) -> str:
+    """A short, safe description of a send failure for the Emails tab."""
     if isinstance(e, smtplib.SMTPAuthenticationError):
         return "SMTP login rejected. For Gmail use a 16-character App Password."
     return f"{type(e).__name__}: {str(e)[:200]}"
 
 
-def send_test(to):
+def send_test(to: str) -> tuple[bool, str]:
     """Send immediately. Returns (ok, error_message)."""
     if not valid_email(to):
         return False, "That doesn't look like a valid email address."
     if not smtp_configured():
         return False, "SMTP isn't configured yet."
     try:
-        _send_smtp(to, "CareCircle test email", "This is a test from CareCircle. If you can read this, reminders will reach you.\n")
+        _send_smtp(to, "CareCircle test email",
+                   "This is a test from CareCircle. If you can read this, reminders will reach you.\n")
         return True, ""
     except Exception as e:
         return False, _describe(e)
 
 
+def send_direct(to: str, subject: str, body: str) -> bool:
+    """Send one email now, without keeping a copy (used when a circle is deleted and nothing about it may remain).
+    Test addresses and servers without email are skipped. Returns True if it was sent."""
+    if not smtp_configured() or _is_test_address(to):
+        return False
+    try:
+        _send_smtp(to, subject, body)
+        return True
+    except Exception as e:
+        log.warning("direct email failed", extra={"error": type(e).__name__})
+        return False
+
+
 # ---------------------------------------------------------------- queue
-def queue(family_id, member, subject, body, kind, key, expires_in=None, priority=0):
+def queue(family_id: int, member: Member, subject: str, body: str, kind: str, key: str,
+          expires_in: float | None = None, priority: int = 0) -> int | None:
     """Queue one email for a member, once per dedupe key. Returns the outbox id, or None if skipped."""
     to = (member.get("email") or "").strip()
     if not valid_email(to):
@@ -139,11 +171,13 @@ def queue(family_id, member, subject, body, kind, key, expires_in=None, priority
             "expires_at": (time.time() + expires_in) if expires_in else None}, c)
 
 
-def queue_many(family_id, members, subject, body, kind, key, expires_in=None, priority=0):
+def queue_many(family_id: int, members: Iterable[Member], subject: str, body: str, kind: str, key: str,
+               expires_in: float | None = None, priority: int = 0) -> list[int]:
+    """Queue the same email for several members. Returns the new outbox ids."""
     return [i for i in (queue(family_id, m, subject, body, kind, key, expires_in, priority) for m in members) if i]
 
 
-def send_secret(family_id, to, subject, body, kind, member_id):
+def send_secret(family_id: int, to: str, subject: str, body: str, kind: str, member_id: int) -> bool:
     """Send a message containing a secret (sign-in code) straight away. Only a redacted copy is stored."""
     status, err = "simulated", ""
     if config.smtp_configured() and not _is_test_address(to):
@@ -160,11 +194,13 @@ def send_secret(family_id, to, subject, body, kind, member_id):
     return status in ("sent", "simulated")
 
 
-def security_alert(member, subject, body, key):
+def security_alert(member: Member, subject: str, body: str, key: str) -> int | None:
+    """Queue a high-priority security email for one member."""
     return queue(member["family_id"], member, subject, body, "security", key, priority=5)
 
 
-def dispatch(owner=None, family_id=None, only_ids=None, now=None, limit=100):
+def dispatch(owner: str | None = None, family_id: int | None = None, only_ids: Sequence[int] | None = None,
+             now: float | None = None, limit: int = 100) -> int:
     """Claim and send due emails. Returns the number processed."""
     now = now or time.time()
     owner = owner or WORKER_ID
@@ -182,8 +218,8 @@ def dispatch(owner=None, family_id=None, only_ids=None, now=None, limit=100):
         ids = [r["id"] for r in c.execute(f"SELECT id FROM outbox WHERE {where} ORDER BY priority DESC, id LIMIT ?",
                                           (*args, limit))]
         if ids:
-            c.execute(f"UPDATE outbox SET status='sending', claimed_by=?, claimed_until=? WHERE id IN ({','.join('?' * len(ids))})",
-                      (owner, now + CLAIM_SEC, *ids))
+            c.execute("UPDATE outbox SET status='sending', claimed_by=?, claimed_until=? "
+                      f"WHERE id IN ({','.join('?' * len(ids))})", (owner, now + CLAIM_SEC, *ids))
     if not ids:
         return 0
     rows = db.q(f"SELECT * FROM outbox WHERE claimed_by=? AND status='sending' AND id IN ({','.join('?' * len(ids))})",
@@ -209,26 +245,30 @@ def dispatch(owner=None, family_id=None, only_ids=None, now=None, limit=100):
     return len(rows)
 
 
-def delivery_problems(family_id, hours=24):
+def delivery_problems(family_id: int, hours: int = 24) -> int:
     """Emails that gave up in the last `hours` (created_at is stored in UTC by SQLite)."""
-    return db.q1("SELECT COUNT(*) AS n FROM outbox WHERE family_id=? AND status='dead' AND created_at>=datetime('now', ?)",
-                 (family_id, f"-{int(hours)} hours"))["n"]
+    return db.count("SELECT COUNT(*) AS n FROM outbox WHERE family_id=? AND status='dead' AND created_at>=datetime('now', ?)",
+                    (family_id, f"-{int(hours)} hours"))
 
 
 # ---------------------------------------------------------------- reminder content
-def _fmt(t):
+def _fmt(t: str) -> str:
+    """'20:00' -> '8:00 PM'."""
     return datetime.strptime(t, "%H:%M").strftime("%I:%M %p").lstrip("0")
 
 
-def _first(name):
+def _first(name: str | None) -> str:
+    """First name only, or 'there' for 'Hello there'."""
     return (name or "").split()[0] if name else "there"
 
 
-def _secs_until(target, now):
+def _secs_until(target: datetime, now: datetime) -> float:
+    """Seconds until `target`, at least a minute."""
     return max(60, (target - now).total_seconds())
 
 
-def _dose_due_email(elder, slot, doses, full):
+def _dose_due_email(elder: str, slot: str, doses: list[Row], full: bool) -> tuple[str, str]:
+    """Subject and body of the 'time for your medicine' email."""
     if full:
         lines = "\n".join(f"- {d['name']} {d['dosage']}".rstrip() + (f" ({d['instructions']})" if d["instructions"] else "")
                           for d in doses)
@@ -240,7 +280,8 @@ def _dose_due_email(elder, slot, doses, full):
             "Open CareCircle to see which, and tap 'Taken' once you have it.\n")
 
 
-def _unconfirmed_email(elder, slot, doses, full):
+def _unconfirmed_email(elder: str, slot: str, doses: list[Row], full: bool) -> tuple[str, str]:
+    """Subject and body of the 'a dose hasn't been confirmed' email."""
     what = (", ".join(f"{d['name']} {d['dosage']}".strip() for d in doses) if full
             else f"{len(doses)} medicine{'s' if len(doses) > 1 else ''}")
     return ("CareCircle: a dose hasn't been confirmed",
@@ -249,16 +290,19 @@ def _unconfirmed_email(elder, slot, doses, full):
             "then mark it in CareCircle.\n")
 
 
-def _refill_email(elder, low, full):
+def _refill_email(elder: str, low: list[Row], full: bool) -> tuple[str, str]:
+    """Subject and body of the refill reminder."""
     if full:
         lines = "\n".join(f"- {m['name']}: {m['stock']} doses left" for m in low)
-        return "CareCircle: refill needed", f"These medicines for {_first(elder)} are running low:\n{lines}\n\nTime to order a refill.\n"
+        return ("CareCircle: refill needed",
+                f"These medicines for {_first(elder)} are running low:\n{lines}\n\nTime to order a refill.\n")
     return ("CareCircle: refill reminder",
             f"{len(low)} of {_first(elder)}'s medicines {'are' if len(low) > 1 else 'is'} running low. "
             "Open CareCircle to see which, and order a refill.\n")
 
 
-def _appt_email(elder, a, when, full, soon):
+def _appt_email(elder: str, a: Row, when: str, full: bool, soon: bool) -> tuple[str, str]:
+    """Subject and body of an appointment reminder (tomorrow, or in under 2 hours)."""
     head = "Appointment in under 2 hours" if soon else "Appointment tomorrow"
     if full:
         body = (f"{_first(elder)} has an appointment with {a['doctor']}"
@@ -267,72 +311,112 @@ def _appt_email(elder, a, when, full, soon):
         if a["questions"]:
             body += f"\nQuestions to ask:\n{a['questions']}\n"
         return f"{head}: {a['doctor']}", body
-    return f"CareCircle: {head.lower()}", f"{_first(elder)} has a doctor's appointment on {when}. Open CareCircle for the details and questions to ask.\n"
+    return (f"CareCircle: {head.lower()}",
+            f"{_first(elder)} has a doctor's appointment on {when}. Open CareCircle for the details and questions to ask.\n")
 
 
 # ---------------------------------------------------------------- the reminder pass
-def _family_pass(fid, now):
-    fam = db.get_family(fid)
-    elder = fam["elder_name"]
-    full = db.family_settings(fid)["email_detail"] == "full"
-    elder_rcpt = db.members(fid, roles=["elder"], with_email=True)
-    everyone = db.members(fid, with_email=True)
-    carers = db.members(fid, roles=["caretaker", "family"], with_email=True)
-    day = now.date().isoformat()
+@dataclass
+class _Circle:
+    """One family as the reminder pass sees it: who gets which email, and how much detail emails may carry."""
 
+    fid: int
+    elder: str                 # the elder's name, for email text
+    full: bool                 # family chose "full" email detail
+    elder_rcpt: list[Member]   # the elder, if they have an email
+    everyone: list[Member]     # everyone with an email
+    carers: list[Member]       # caretakers and family with an email
+    now: datetime
+
+    @property
+    def day(self) -> str:
+        """Today's date as YYYY-MM-DD."""
+        return self.now.date().isoformat()
+
+    @classmethod
+    def load(cls, fid: int, now: datetime) -> _Circle:
+        """Read the family's settings and recipients once for the whole pass."""
+        return cls(fid, db.get_family(fid)["elder_name"], db.family_settings(fid)["email_detail"] == "full",
+                   db.members(fid, roles=["elder"], with_email=True), db.members(fid, with_email=True),
+                   db.members(fid, roles=["caretaker", "family"], with_email=True), now)
+
+
+def _dose_reminders(c: _Circle) -> None:
+    """Remind the elder of doses due now; tell everyone about doses still unconfirmed after the grace period."""
     # yesterday's leftovers (app was off): resolve silently so adherence stays honest
-    for d in db.doses_for_day(fid, (now.date() - timedelta(days=1)).isoformat()):
+    for d in db.doses_for_day(c.fid, (c.now.date() - timedelta(days=1)).isoformat()):
         if d["status"] == "pending":
-            db.auto_unconfirm(fid, d["id"], now)
+            db.auto_unconfirm(c.fid, d["id"], c.now)
 
-    due, late = {}, {}
-    for d in db.doses_for_day(fid, day):
+    due: dict[str, list[Row]] = {}
+    late: dict[str, list[Row]] = {}
+    for d in db.doses_for_day(c.fid, c.day):
         if d["status"] != "pending":
             continue
         sched = datetime.fromisoformat(f"{d['scheduled_date']}T{d['scheduled_time']}")
-        mins = (now - sched).total_seconds() / 60
+        mins = (c.now - sched).total_seconds() / 60
         if -LEAD_MIN <= mins < GRACE_MIN:
             due.setdefault(d["scheduled_time"], []).append(d)
         elif mins >= GRACE_MIN:
-            db.auto_unconfirm(fid, d["id"], now)
+            db.auto_unconfirm(c.fid, d["id"], c.now)
             if mins < STALE_MIN:
                 late.setdefault(d["scheduled_time"], []).append(d)
     for slot, doses in due.items():
-        subject, body = _dose_due_email(elder, slot, doses, full)
-        deadline = datetime.fromisoformat(f"{day}T{slot}") + timedelta(minutes=GRACE_MIN)
-        queue_many(fid, elder_rcpt, subject, body, "dose_due", f"dose-due-{fid}-{day}-{slot}",
-                   expires_in=_secs_until(deadline, now))
+        subject, body = _dose_due_email(c.elder, slot, doses, c.full)
+        deadline = datetime.fromisoformat(f"{c.day}T{slot}") + timedelta(minutes=GRACE_MIN)
+        queue_many(c.fid, c.elder_rcpt, subject, body, "dose_due", f"dose-due-{c.fid}-{c.day}-{slot}",
+                   expires_in=_secs_until(deadline, c.now))
     for slot, doses in late.items():
-        subject, body = _unconfirmed_email(elder, slot, doses, full)
-        deadline = datetime.fromisoformat(f"{day}T{slot}") + timedelta(minutes=STALE_MIN)
-        queue_many(fid, everyone, subject, body, "dose_unconfirmed", f"dose-unconfirmed-{fid}-{day}-{slot}",
-                   expires_in=_secs_until(deadline, now))
+        subject, body = _unconfirmed_email(c.elder, slot, doses, c.full)
+        deadline = datetime.fromisoformat(f"{c.day}T{slot}") + timedelta(minutes=STALE_MIN)
+        queue_many(c.fid, c.everyone, subject, body, "dose_unconfirmed", f"dose-unconfirmed-{c.fid}-{c.day}-{slot}",
+                   expires_in=_secs_until(deadline, c.now))
 
-    low = [m for m in db.meds(fid) if m["stock"] is not None and m["stock"] <= (m["refill_at"] or 5)]
+
+def _refill_reminders(c: _Circle) -> None:
+    """One email a day while any medicine is at or below its refill level."""
+    low = [m for m in db.meds(c.fid) if m["stock"] is not None and m["stock"] <= (m["refill_at"] or DEFAULT_REFILL_AT)]
     if low:
-        subject, body = _refill_email(elder, low, full)
+        subject, body = _refill_email(c.elder, low, c.full)
         ids = "-".join(str(m["id"]) for m in sorted(low, key=lambda m: m["id"]))
-        queue_many(fid, carers + elder_rcpt, subject, body, "low_stock", f"lowstock-{fid}-{day}-{ids}")
+        queue_many(c.fid, c.carers + c.elder_rcpt, subject, body, "low_stock", f"lowstock-{c.fid}-{c.day}-{ids}")
 
-    for a in db.appts(fid, now=now):
+
+def _appointment_reminders(c: _Circle) -> None:
+    """Remind everyone 24 hours and 2 hours before each appointment."""
+    for a in db.appts(c.fid, now=c.now):
         start = datetime.fromisoformat(a["when_at"])
-        hrs = (start - now).total_seconds() / 3600
+        hrs = (start - c.now).total_seconds() / 3600
         when = start.strftime("%a %d %b, %I:%M %p")
-        if 0 < hrs <= 2:
-            subject, body = _appt_email(elder, a, when, full, True)
-            queue_many(fid, everyone, subject, body, "appt_2h", f"appt2h-{a['id']}", expires_in=_secs_until(start, now))
-        elif 2 < hrs <= 24:
-            subject, body = _appt_email(elder, a, when, full, False)
-            queue_many(fid, everyone, subject, body, "appt_24h", f"appt24h-{a['id']}", expires_in=_secs_until(start, now))
-
-    if now.hour >= DIGEST_HOUR:
-        from insights import daily_summary
-        midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
-        queue_many(fid, carers, f"CareCircle: today's summary for {_first(elder)}", daily_summary(fid, now.date(), full=full),
-                   "digest", f"digest-{fid}-{day}", expires_in=_secs_until(midnight, now))
+        if 0 < hrs <= APPT_SOON_HOURS:
+            subject, body = _appt_email(c.elder, a, when, c.full, True)
+            queue_many(c.fid, c.everyone, subject, body, "appt_2h", f"appt2h-{a['id']}",
+                       expires_in=_secs_until(start, c.now))
+        elif APPT_SOON_HOURS < hrs <= APPT_DAY_HOURS:
+            subject, body = _appt_email(c.elder, a, when, c.full, False)
+            queue_many(c.fid, c.everyone, subject, body, "appt_24h", f"appt24h-{a['id']}",
+                       expires_in=_secs_until(start, c.now))
 
 
-def run_reminders(now=None, family_ids=None):
+def _evening_digest(c: _Circle) -> None:
+    """After DIGEST_HOUR, send caretakers and family a summary of the day."""
+    if c.now.hour < DIGEST_HOUR:
+        return
+    from insights import daily_summary
+    midnight = datetime.combine(c.now.date() + timedelta(days=1), datetime.min.time())
+    queue_many(c.fid, c.carers, f"CareCircle: today's summary for {_first(c.elder)}",
+               daily_summary(c.fid, c.now.date(), full=c.full), "digest", f"digest-{c.fid}-{c.day}",
+               expires_in=_secs_until(midnight, c.now))
+
+
+def _family_pass(fid: int, now: datetime) -> None:
+    """Queue every reminder that is due for one family at `now`."""
+    circle = _Circle.load(fid, now)
+    for step in (_dose_reminders, _refill_reminders, _appointment_reminders, _evening_digest):
+        step(circle)
+
+
+def run_reminders(now: datetime | None = None, family_ids: Iterable[int] | None = None) -> int:
     """One reminder pass. `now` simulates a time (demo); `family_ids` limits it to some families."""
     now = now or clock.now()
     ids = db.family_ids() if family_ids is None else list(family_ids)
@@ -344,10 +428,10 @@ def run_reminders(now=None, family_ids=None):
     return dispatch(family_id=ids[0] if family_ids is not None and len(ids) == 1 else None)
 
 
-def help_alert(family_id, elder_member):
+def help_alert(family_id: int, elder_member: Member) -> Notice:
     """The elder pressed 'I need help'. Email every caretaker and family member now."""
     carers = db.members(family_id, roles=["caretaker", "family"], with_email=True)
-    bucket = int(time.time() // 300)
+    bucket = int(time.time() // HELP_BUCKET_SEC)
     stamp = clock.now().strftime("%I:%M %p").lstrip("0")
     ids = queue_many(family_id, carers, f"URGENT: {_first(elder_member['name'])} pressed 'I need help'",
                      f"{elder_member['name']} pressed 'I need help' in CareCircle at {stamp}.\n\n"
@@ -362,7 +446,7 @@ def help_alert(family_id, elder_member):
             "simulated": any(r["status"] == "simulated" for r in sent)}
 
 
-def appointment_notice(family_id, appt_id, change):
+def appointment_notice(family_id: int, appt_id: int, change: str) -> Notice:
     """Email the circle straight away when an appointment is added or cancelled.
 
     An 'added' notice for an appointment within the next 24 h (or 2 h) takes the place of the scheduled
@@ -379,7 +463,8 @@ def appointment_notice(family_id, appt_id, change):
     if change == "added":
         if hrs <= 0:
             return {"recipients": 0, "delivered": 0, "simulated": False}
-        key = f"appt2h-{appt_id}" if hrs <= 2 else f"appt24h-{appt_id}" if hrs <= 24 else f"appt-added-{appt_id}"
+        key = (f"appt2h-{appt_id}" if hrs <= APPT_SOON_HOURS else f"appt24h-{appt_id}" if hrs <= APPT_DAY_HOURS
+               else f"appt-added-{appt_id}")
         if full:
             subject = f"Appointment added: {a['doctor']} on {when}"
             body = (f"A doctor's appointment for {elder} was added:\n\n{a['doctor']}"
@@ -390,7 +475,7 @@ def appointment_notice(family_id, appt_id, change):
         else:
             subject = "CareCircle: doctor's appointment added"
             body = f"A doctor's appointment for {elder} was added for {when}.\n\nOpen CareCircle for the details.\n"
-        body += "\nCareCircle will also remind you 24 hours and 2 hours before.\n" if hrs > 24 else ""
+        body += "\nCareCircle will also remind you 24 hours and 2 hours before.\n" if hrs > APPT_DAY_HOURS else ""
         ids = queue_many(family_id, people, subject, body, "appt_added", key,
                          expires_in=_secs_until(start, now), priority=5)
     else:
@@ -406,14 +491,15 @@ def appointment_notice(family_id, appt_id, change):
             "delivered": n["sent"] + n["simulated"], "simulated": n["simulated"] > 0}
 
 
-def _send_now(family_id, people, subject, body, kind):
+def _send_now(family_id: int, people: Iterable[Member], subject: str, body: str, kind: str) -> int:
+    """Queue an email for several people and send it now. Returns how many were queued."""
     ids = queue_many(family_id, people, subject, body, kind, f"{kind}-{crypto.token()}", priority=5)
     if ids:
         dispatch(only_ids=ids)
     return len(ids)
 
 
-def med_change_notice(family_id, change_id, approved_by=None):
+def med_change_notice(family_id: int, change_id: int, approved_by: str | None = None) -> int:
     """Tell the elder that someone else changed (or wants to change) one of their medicines."""
     from services import describe_change
     c = db.get_change(family_id, change_id)
@@ -427,8 +513,8 @@ def med_change_notice(family_id, change_id, approved_by=None):
     if c["action"] == "add" and pending and approved_by is None:
         what = "suggested a new medicine for you" if not full else describe_change(c).replace("added", "suggested adding", 1)
     else:
-        what = (describe_change(c) if full else
-                {"add": "added a medicine", "edit": "changed one of your medicines", "stop": "stopped one of your medicines"}[c["action"]])
+        brief = {"add": "added a medicine", "edit": "changed one of your medicines", "stop": "stopped one of your medicines"}
+        what = describe_change(c) if full else brief[c["action"]]
     if pending:
         subject = "CareCircle: a medicine change needs your OK"
         ask = "Nothing changes until you approve it. Open CareCircle and choose Approve or Decline."
@@ -439,7 +525,7 @@ def med_change_notice(family_id, change_id, approved_by=None):
     return _send_now(family_id, elders, subject, body, "med_change")
 
 
-def med_change_reply(family_id, change_id):
+def med_change_reply(family_id: int, change_id: int) -> int:
     """Tell the person who made a change, and the caretakers, that the elder disagreed with it or declined it."""
     from services import describe_change
     c = db.get_change(family_id, change_id)
@@ -459,7 +545,8 @@ def med_change_reply(family_id, change_id):
     return _send_now(family_id, people, subject, body, "med_change_reply")
 
 
-def help_cancel(family_id, elder_member):
+def help_cancel(family_id: int, elder_member: Member) -> int:
+    """Tell carers the help alert was pressed by mistake. Returns how many were emailed."""
     carers = db.members(family_id, roles=["caretaker", "family"], with_email=True)
     ids = queue_many(family_id, carers, f"CareCircle: {_first(elder_member['name'])}'s help alert was a mistake",
                      f"{elder_member['name']} says the 'I need help' alert was pressed by mistake. "
@@ -470,7 +557,7 @@ def help_cancel(family_id, elder_member):
 
 
 # ---------------------------------------------------------------- scheduler
-def tick(owner=WORKER_ID):
+def tick(owner: str = WORKER_ID) -> bool:
     """Run one pass if this process holds the reminder lease. Returns True if it ran."""
     interval = config.scheduler_interval()
     if not db.acquire_lease("reminders", owner, max(120, interval * 3), time.time()):
@@ -490,7 +577,7 @@ _started = False
 _lock = threading.Lock()
 
 
-def start_scheduler(interval=None):
+def start_scheduler(interval: int | None = None) -> None:
     """Background thread inside the web app. Safe to call repeatedly."""
     global _started
     with _lock:
@@ -498,7 +585,8 @@ def start_scheduler(interval=None):
             return
         _started = True
 
-    def loop():
+    def loop() -> None:
+        """Run a reminder pass every interval, forever; errors are logged, never fatal."""
         while True:
             try:
                 tick()

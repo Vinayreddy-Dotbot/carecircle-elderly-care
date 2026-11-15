@@ -3,6 +3,10 @@
 The Hindi strings were written for this project and should be checked by a native speaker before release,
 especially the safety and emergency text. Other screens are English only for now.
 """
+
+from __future__ import annotations
+
+from typing import Any
 LANGS = {"en": "English", "hi": "हिन्दी"}
 
 STRINGS = {
@@ -24,7 +28,7 @@ STRINGS = {
         "st_skipped": "Skipped (marked by {who})",
         "st_missed": "Not taken (marked by {who})",
         "st_unconfirmed": "Not confirmed yet",
-        "st_pending": "",
+        "st_pending": "Not taken yet",
         "honesty": "CareCircle records what people tap. It can't see the medicine being taken.",
         "next_appt": "🩺 Next appointment",
         "help_btn": "🆘 I need help",
@@ -37,6 +41,7 @@ STRINGS = {
         "help_mistake": "It was a mistake",
         "help_cancelled": "We told everyone it was a mistake.",
         "read_aloud": "Read my medicines aloud",
+        "read_aloud_unsupported": "This browser can't read aloud",
         "print": "⬇️ Printable medicine list",
         "print_help": "A large-print list you can keep on paper, for when the internet or the app isn't available.",
         "large_text": "Large text",
@@ -56,6 +61,10 @@ STRINGS = {
         "ast_title": "🧭 What needs attention now",
         "ast_none": "Nothing needs attention right now. 🌿",
         "ast_why": "Why",
+        "lvl_urgent": "Urgent",
+        "lvl_todo": "To do",
+        "lvl_info": "Good to know",
+        "lvl_good": "Good news",
         "ast_missed": "You haven't marked your {time} {name} yet. If you've taken it, tap Taken below.",
         "ast_missed_why": "Your family is told when a dose isn't confirmed, so they don't worry for nothing.",
         "ast_due": "It's time for {name} {dosage}{instr}.",
@@ -95,7 +104,7 @@ STRINGS = {
         "st_skipped": "छोड़ी गई ({who} ने दर्ज किया)",
         "st_missed": "नहीं ली गई ({who} ने दर्ज किया)",
         "st_unconfirmed": "अभी पुष्टि नहीं हुई",
-        "st_pending": "",
+        "st_pending": "अभी नहीं ली गई",
         "honesty": "CareCircle वही दर्ज करता है जो लोग बटन दबाकर बताते हैं। यह दवा लेते हुए नहीं देख सकता।",
         "next_appt": "🩺 अगली डॉक्टर मुलाक़ात",
         "help_btn": "🆘 मुझे मदद चाहिए",
@@ -108,6 +117,7 @@ STRINGS = {
         "help_mistake": "गलती से दब गया",
         "help_cancelled": "हमने सबको बता दिया कि यह गलती से हुआ था।",
         "read_aloud": "मेरी दवाइयाँ पढ़कर सुनाएँ",
+        "read_aloud_unsupported": "यह ब्राउज़र पढ़कर नहीं सुना सकता",
         "print": "⬇️ प्रिंट करने लायक दवा-सूची",
         "print_help": "बड़े अक्षरों वाली सूची, जिसे काग़ज़ पर रख सकते हैं, जब इंटरनेट या ऐप न चले।",
         "large_text": "बड़े अक्षर",
@@ -127,6 +137,10 @@ STRINGS = {
         "ast_title": "🧭 अभी किस पर ध्यान देना है",
         "ast_none": "अभी किसी बात पर ध्यान देने की ज़रूरत नहीं है। 🌿",
         "ast_why": "क्यों",
+        "lvl_urgent": "ज़रूरी",
+        "lvl_todo": "करना है",
+        "lvl_info": "जानकारी",
+        "lvl_good": "अच्छी खबर",
         "ast_missed": "आपने {time} की {name} अभी तक दर्ज नहीं की है। अगर ले ली है, तो नीचे 'ले ली' दबाएँ।",
         "ast_missed_why": "दवा की पुष्टि न होने पर आपके परिवार को बताया जाता है, ताकि वे बेवजह चिंता न करें।",
         "ast_due": "{name} {dosage} लेने का समय हो गया है{instr}।",
@@ -151,7 +165,8 @@ STRINGS = {
 }
 
 
-def t(key, lang="en", **kw):
+def t(key: str, lang: str = "en", **kw: Any) -> str:
+    """Text for `key` in `lang` (falling back to English, then to the key itself), with {placeholders} filled in."""
     table = STRINGS.get(lang) or STRINGS["en"]
     text = table.get(key, STRINGS["en"].get(key, key))
     return text.format(**kw) if kw else text

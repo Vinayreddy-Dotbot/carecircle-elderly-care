@@ -3,6 +3,8 @@
 Backups are consistent SQLite snapshots (online backup API) encrypted with AES-256-GCM using a key derived
 from DATA_KEY. A backup is useless without that key, so store the key separately from the backups.
 """
+from __future__ import annotations
+
 import contextlib
 import json
 import logging
@@ -10,12 +12,15 @@ import os
 import sqlite3
 import tempfile
 import time
+from collections.abc import Sequence
 from datetime import timedelta
+from typing import Any
 
 import clock
 import config
 import crypto
 import db
+from typedefs import Row
 
 log = logging.getLogger("carecircle.maintenance")
 MAGIC = b"CCBK1\n"
@@ -31,12 +36,14 @@ RETENTION_DEFAULTS = {  # days
 }
 
 
-def retention():
+def retention() -> dict[str, int]:
+    """How many days each kind of data is kept (configurable, 1 day to 100 years)."""
     return {k: config.get_int(k, v, lo=1, hi=36500) for k, v in RETENTION_DEFAULTS.items()}
 
 
 # ---------------------------------------------------------------- backup / restore
-def _snapshot(dest_plain):
+def _snapshot(dest_plain: str) -> None:
+    """A consistent copy of the live database, using SQLite's online backup."""
     src = sqlite3.connect(config.db_path())
     dst = sqlite3.connect(dest_plain)
     try:
@@ -46,7 +53,7 @@ def _snapshot(dest_plain):
         src.close()
 
 
-def backup(dest=None):
+def backup(dest: str | None = None) -> str:
     """Write an encrypted backup. Returns its path."""
     if dest is None:
         folder = config.get("BACKUP_DIR", os.path.dirname(os.path.abspath(config.db_path())))
@@ -69,7 +76,8 @@ def backup(dest=None):
     return dest
 
 
-def _wipe(path):
+def _wipe(path: str) -> None:
+    """Overwrite a temporary plaintext file with zeros, then delete it."""
     with contextlib.suppress(OSError):
         size = os.path.getsize(path)
         with open(path, "r+b") as f:
@@ -77,7 +85,8 @@ def _wipe(path):
         os.remove(path)
 
 
-def decrypt_backup(src):
+def decrypt_backup(src: str) -> bytes:
+    """The plaintext database inside a backup file, if the right key is available."""
     with open(src, "rb") as f:
         blob = f.read()
     if not blob.startswith(MAGIC):
@@ -91,7 +100,7 @@ def decrypt_backup(src):
         raise crypto.DecryptionError("backup is corrupted or was made with a different key") from None
 
 
-def verify_backup(src):
+def verify_backup(src: str) -> dict[str, Any]:
     """Decrypt to a temporary file and run SQLite's integrity check. Returns a summary dict."""
     plain = decrypt_backup(src)
     fd, tmp = tempfile.mkstemp(suffix=".db")
@@ -112,7 +121,7 @@ def verify_backup(src):
         _wipe(tmp)
 
 
-def restore(src):
+def restore(src: str) -> dict[str, Any]:
     """Replace the live database with a backup (after verifying it), then apply any newer migrations.
     The current database is first saved as an encrypted backup next to it."""
     info = verify_backup(src)
@@ -140,13 +149,14 @@ def restore(src):
 
 
 # ---------------------------------------------------------------- retention
-def purge(now=None):
+def purge(now: float | None = None) -> dict[str, int]:
     """Delete data older than the retention periods. Returns counts per table."""
     r = retention()
     now = now or time.time()
-    out = {}
+    out: dict[str, int] = {}
 
-    def run(name, sql, args):
+    def run(name: str, sql: str, args: Sequence[Any]) -> None:
+        """Run one delete and count the rows."""
         out[name] = out.get(name, 0) + db.x(sql, args)
 
     run("doses", "DELETE FROM doses WHERE scheduled_date < date('now', ?)", (f"-{r['RETENTION_DOSE_DAYS']} days",))
@@ -170,20 +180,22 @@ def purge(now=None):
 
 
 # ---------------------------------------------------------------- export & delete
-def export_family(family_id):
+def export_family(family_id: int) -> str:
     """Everything CareCircle holds about one care circle, as JSON (decrypted). Access codes are not included."""
-    def rows(sql, args=(family_id,)):
+    def rows(sql: str, args: Sequence[Any] = (family_id,)) -> list[Row]:
+        """Rows for this family."""
         return db.q(sql, args)
 
     fam = db.get_family(family_id)
-    data = {
+    data: dict[str, Any] = {
         "exported_at": clock.now().isoformat(timespec="seconds"),
         "family": {"name": fam["name"], "elder_name": fam["elder_name"], "created_at": fam["created_at"],
                    "settings": db.family_settings(family_id)},
         "members": [{k: m[k] for k in ("id", "name", "email", "role", "lang", "created_at", "last_login_at")}
                     for m in db.members(family_id)],
         "medications": rows("SELECT * FROM medications WHERE family_id=?"),
-        "doses": rows("SELECT id, med_id, scheduled_date, scheduled_time, status, marked_by, marked_at FROM doses WHERE family_id=?"),
+        "doses": rows("SELECT id, med_id, scheduled_date, scheduled_time, status, marked_by, marked_at "
+                      "FROM doses WHERE family_id=?"),
         "stock_events": rows("SELECT * FROM stock_events WHERE family_id=?"),
         "medicine_changes": rows("SELECT med_id, action, before_json, after_json, by_name, status, note, resolved_by, "
                                  "created_at, resolved_at FROM med_changes WHERE family_id=?"),
@@ -198,7 +210,8 @@ def export_family(family_id):
     return json.dumps(data, indent=2, default=str)
 
 
-def delete_family(family_id):
+def delete_family(family_id: int) -> int:
+    """Delete a circle and everything in it. Returns the number of rows deleted."""
     n = db.delete_family_rows(family_id)
     db.security_event("family_deleted", None, None, f"family {family_id}, {n} rows")
     with contextlib.suppress(Exception):
@@ -209,10 +222,10 @@ def delete_family(family_id):
 
 
 # ---------------------------------------------------------------- key rotation
-def rotate_key(force=False):
+def rotate_key(force: bool = False) -> int:
     """Re-encrypt every encrypted value with the current DATA_KEY. The old key must be in DATA_KEY_PREVIOUS.
     Members still on a pre-upgrade 6-character code would lose it (its lookup is keyed); refuse unless force."""
-    legacy = db.q1("SELECT COUNT(*) AS n FROM members WHERE legacy_lookup IS NOT NULL")["n"]
+    legacy = db.count("SELECT COUNT(*) AS n FROM members WHERE legacy_lookup IS NOT NULL")
     if legacy and not force:
         raise RuntimeError(f"{legacy} member(s) still use an old 6-character code. Ask them to sign in once, "
                            "or run with --force and give them new codes.")

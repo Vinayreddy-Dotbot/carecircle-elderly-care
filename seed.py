@@ -1,4 +1,7 @@
 """Sample family for demos. Refuses to run in production, and marks everything it creates as demo data."""
+from __future__ import annotations
+
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 
 import clock
@@ -11,7 +14,7 @@ class DemoDisabled(Exception):
     pass
 
 
-def seed_demo(clients=()):
+def seed_demo(clients: Sequence[str] = ()) -> dict[str, str]:
     """Creates the sample Sharma family with a week of history. Returns dict of access codes."""
     if not config.demo_features():
         raise DemoDisabled("The sample family is disabled in production.")

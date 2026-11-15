@@ -1,0 +1,17 @@
+# Streamlit settings for CareCircle (safe to commit: no secrets here; secrets go in secrets.toml, which is ignored).
+
+[client]
+# Visitors never see Python tracebacks or exception text. The app shows its own friendly message with a reference
+# number, and the full error goes to the server log.
+showErrorDetails = "none"
+# Hide developer options (rerun, clear cache, deploy) from visitors.
+toolbarMode = "viewer"
+
+[server]
+# Stated explicitly so a future default change can't turn these off.
+enableXsrfProtection = true
+enableCORS = true
+
+[browser]
+# Don't send usage statistics about this health app to Streamlit.
+gatherUsageStats = false
