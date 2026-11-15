@@ -1,0 +1,69 @@
+{
+  "meta": {
+    "version": 2,
+    "description": "Small offline list of well-known interactions, used only as a prompt to ask a pharmacist. It is NOT a drug interaction database and most combinations are not covered.",
+    "sources": "Interaction messages carried over from CareCircle v1 and generalised to the drug classes they already named (NSAIDs, ACE inhibitors, nitrates). Brand names map to their generic ingredient.",
+    "reviewed_by": null,
+    "reviewed_on": null
+  },
+  "ingredients": {
+    "paracetamol": ["acetaminophen", "crocin", "dolo", "calpol", "tylenol", "panadol"],
+    "ibuprofen": ["brufen", "advil", "motrin", "nurofen"],
+    "naproxen": ["aleve", "naprosyn"],
+    "diclofenac": ["voveran", "voltaren", "voltarol"],
+    "aceclofenac": [],
+    "aspirin": ["ecosprin", "disprin", "acetylsalicylic acid"],
+    "warfarin": ["coumadin"],
+    "metformin": ["glycomet", "glucophage"],
+    "lisinopril": ["zestril", "prinivil"],
+    "enalapril": ["vasotec"],
+    "ramipril": ["altace", "cardace"],
+    "perindopril": ["coversyl"],
+    "captopril": ["capoten"],
+    "spironolactone": ["aldactone"],
+    "sildenafil": ["viagra", "revatio"],
+    "tadalafil": ["cialis"],
+    "vardenafil": ["levitra"],
+    "nitroglycerin": ["nitroglycerine", "glyceryl trinitrate", "nitrostat", "gtn"],
+    "isosorbide mononitrate": ["imdur"],
+    "isosorbide dinitrate": ["isordil", "sorbitrate"],
+    "simvastatin": ["zocor"],
+    "clarithromycin": ["biaxin", "klacid"],
+    "amlodipine": ["norvasc", "amlong", "stamlo"],
+    "levothyroxine": ["thyroxine", "synthroid", "eltroxin", "thyronorm", "euthyrox", "levoxyl"],
+    "calcium": ["calcium carbonate", "calcium citrate", "shelcal"],
+    "iron": ["ferrous sulfate", "ferrous sulphate", "ferrous fumarate", "ferrous gluconate"],
+    "sertraline": ["zoloft"],
+    "tramadol": ["ultram"],
+    "digoxin": ["lanoxin"],
+    "furosemide": ["frusemide", "lasix"],
+    "alcohol": ["ethanol"]
+  },
+  "products": {
+    "combiflam": ["ibuprofen", "paracetamol"],
+    "ultracet": ["tramadol", "paracetamol"]
+  },
+  "classes": {
+    "nsaid": {"label": "NSAID painkillers", "members": ["ibuprofen", "naproxen", "diclofenac", "aceclofenac"]},
+    "ace_inhibitor": {"label": "ACE inhibitors", "members": ["lisinopril", "enalapril", "ramipril", "perindopril", "captopril"]},
+    "pde5_inhibitor": {"label": "PDE5 inhibitors", "members": ["sildenafil", "tadalafil", "vardenafil"]},
+    "nitrate": {"label": "nitrates", "members": ["nitroglycerin", "isosorbide mononitrate", "isosorbide dinitrate"]}
+  },
+  "rules": [
+    {"group": "warfarin-aspirin", "a": "warfarin", "b": "aspirin", "message": "Warfarin + aspirin can raise bleeding risk."},
+    {"group": "warfarin-nsaid", "a": "warfarin", "b": "class:nsaid", "message": "Warfarin + NSAID painkillers (like ibuprofen) can raise bleeding risk."},
+    {"group": "aspirin-nsaid", "a": "aspirin", "b": "ibuprofen", "message": "Ibuprofen may reduce aspirin's heart-protective effect, and both irritate the stomach."},
+    {"group": "aspirin-nsaid", "a": "aspirin", "b": "class:nsaid", "message": "Aspirin + another NSAID painkiller raises the risk of stomach bleeding."},
+    {"group": "ace-spironolactone", "a": "class:ace_inhibitor", "b": "spironolactone", "message": "ACE inhibitor + spironolactone can push potassium too high."},
+    {"group": "ace-nsaid", "a": "class:ace_inhibitor", "b": "class:nsaid", "message": "NSAIDs can weaken blood-pressure medicines and strain the kidneys."},
+    {"group": "metformin-alcohol", "a": "metformin", "b": "alcohol", "message": "Metformin with alcohol raises the risk of lactic acidosis."},
+    {"group": "pde5-nitrate", "a": "class:pde5_inhibitor", "b": "class:nitrate", "message": "Medicines like sildenafil or tadalafil taken with nitrates can cause a dangerous drop in blood pressure."},
+    {"group": "simvastatin-clarithromycin", "a": "simvastatin", "b": "clarithromycin", "message": "Clarithromycin can raise simvastatin levels and cause muscle damage."},
+    {"group": "amlodipine-simvastatin", "a": "amlodipine", "b": "simvastatin", "message": "Amlodipine can raise simvastatin levels; dose limits apply."},
+    {"group": "levothyroxine-calcium", "a": "levothyroxine", "b": "calcium", "message": "Calcium blocks levothyroxine absorption - take them 4 hours apart."},
+    {"group": "levothyroxine-iron", "a": "levothyroxine", "b": "iron", "message": "Iron blocks levothyroxine absorption - take them 4 hours apart."},
+    {"group": "sertraline-tramadol", "a": "sertraline", "b": "tramadol", "message": "Sertraline + tramadol can cause serotonin syndrome and seizures."},
+    {"group": "digoxin-furosemide", "a": "digoxin", "b": "furosemide", "message": "Furosemide can lower potassium, which makes digoxin toxicity more likely."}
+  ],
+  "duplicate_classes": ["nsaid"]
+}

@@ -1,0 +1,4 @@
+streamlit>=1.45,<2      # 1.45+ for st.context.ip_address (used only as a soft rate-limit signal)
+pandas>=2
+tzdata
+cryptography>=42        # AES-GCM field encryption, encrypted backups
